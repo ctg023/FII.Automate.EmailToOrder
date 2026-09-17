@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Order Extraction Schema",
+  "description": "Normalized shape that every incoming order (from email body, PDF, Word, CSV, or Excel) is extracted into. Both the Claude-based extractor (text/PDF/Word) and the programmatic parser (CSV/Excel) must emit this shape. Used as the ground-truth format for Step 1 answer keys and the output contract for Step 2.",
+  "type": "object",
+  "properties": {
+    "customer": {
+      "type": "object",
+      "description": "The buying company as stated on the order. Names/codes are as-written; resolution to a BC customer happens later in verification, not here.",
+      "properties": {
+        "name": { "type": ["string", "null"], "description": "Company name as written on the order." },
+        "customer_po_account": { "type": ["string", "null"], "description": "Any customer account/vendor number they reference for themselves or for Buckeye, if present." },
+        "contact_name": { "type": ["string", "null"] },
+        "contact_email": { "type": ["string", "null"] },
+        "contact_phone": { "type": ["string", "null"] }
+      },
+      "required": ["name"]
+    },
+    "po_number": { "type": ["string", "null"], "description": "Customer purchase order number, verbatim." },
+    "order_date": { "type": ["string", "null"], "description": "PO date as stated (ISO 8601 if unambiguous, else verbatim)." },
+    "requested_ship_date": { "type": ["string", "null"], "description": "Requested ship/delivery/dock date if stated." },
+    "ship_to": {
+      "type": "object",
+      "description": "Destination address for the goods.",
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "line1": { "type": ["string", "null"] },
+        "line2": { "type": ["string", "null"] },
+        "city": { "type": ["string", "null"] },
+        "state": { "type": ["string", "null"] },
+        "postal_code": { "type": ["string", "null"] },
+        "country": { "type": ["string", "null"] }
+      }
+    },
+    "freight_terms": { "type": ["string", "null"], "description": "e.g. 'FOB Origin', 'Prepaid & Add', carrier/account if given." },
+    "payment_terms": { "type": ["string", "null"], "description": "e.g. 'Net 30', if stated." },
+    "line_items": {
+      "type": "array",
+      "description": "One entry per ordered line. Empty array if this is an order-related email that contains no line items.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "line_no": { "type": ["integer", "null"], "description": "Line number as printed on the PO, if any." },
+          "customer_part": { "type": ["string", "null"], "description": "The part number the customer uses (their PN)." },
+          "supplier_part": { "type": ["string", "null"], "description": "Buckeye's / the supplier's part number or SKU, if the customer cited it." },
+          "description": { "type": ["string", "null"], "description": "Item description as written." },
+          "quantity": { "type": ["number", "null"] },
+          "uom": { "type": ["string", "null"], "description": "Unit of measure as written, e.g. EA, M (thousand), LB, PC." },
+          "unit_price": { "type": ["number", "null"], "description": "Price per UOM as written; null if not stated on the order." },
+          "line_total": { "type": ["number", "null"] }
+        }
+      }
+    },
+    "notes": { "type": ["string", "null"], "description": "Any order-relevant free text (special instructions, packaging, certs required, etc.)." },
+    "extraction_flags": {
+      "type": "array",
+      "description": "Machine/annotator notes about extraction difficulty for this sample — NOT part of the order itself. e.g. 'price omitted on PO', 'handwritten qty', 'multi-page PDF', 'order spans body + attachment'.",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["customer", "po_number", "line_items"]
+}
