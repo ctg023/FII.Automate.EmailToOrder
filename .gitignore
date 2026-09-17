@@ -33,4 +33,4 @@ samples/raw/
 samples/answer-keys/
 samples/manifest.csv
 samples/FINDINGS.md
-samples/step2-report.json
+samples/*-report.json

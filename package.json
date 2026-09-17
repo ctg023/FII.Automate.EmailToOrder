@@ -5,7 +5,9 @@
   "type": "module",
   "description": "FII.Auto.OrderProcessing - orders@ mailbox to Business Central sales order automation.",
   "scripts": {
-    "extract": "node src/step2-extraction/run.js"
+    "extract": "node src/step2-extraction/run.js",
+    "classify": "node src/step3-classification/run.js",
+    "bc:ping": "node src/step4-bc-verification/ping.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
