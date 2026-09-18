@@ -26,6 +26,10 @@ Thumbs.db
 tmp/
 out/
 
+# --- Live mailbox ingestion: local processed-state + pulled emails (contain PII) ---
+src/ingestion/.ingest-state.json
+.inbox/
+
 # --- Real customer sample data: DO NOT publish (regenerable from the mailbox) ---
 # Contains customer names, contacts, PO numbers, pricing. Keep out of the (public) repo.
 # The generic schema and README below are intentionally NOT ignored.
