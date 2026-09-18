@@ -32,6 +32,11 @@ orders are NOT routed per salesperson** (so customer `salespersonCode` coverage 
 BC-side items (some now confirmed from the live probe on 2026-09-17):
 - ✅ BC connectivity confirmed — NavUserPassword auth works; OData API v2.0 published; read access on
   customers/items/salesOrders. `Fasteners` is the real production company (**9,379 customers**, 10,042 items).
+- ✅ **Rule 2 cross-reference path built & working** — `verify.js` resolves customer part numbers via the
+  live `Item_References_Excel` OData service (narrowed to the resolved customer), then checks inventory.
+  Confirmed on real orders (e.g. S44 3/4 lines, S08 → APPROVE-READY). APPROVE-READY 8/29 and rising as
+  Rule 1 / UoM are tuned. Remaining line gaps: unresolved customers, genuine stock-outs, and EA↔PCS UoM
+  skips (a UoM synonym map is a Later item).
 - ✅ **Rule 1 (customer match) validated on real data: 18/29 (62%)** resolved cleanly via `verify.js --batch`.
   The remaining 11: 3 extraction gaps (S12/S13/S35, no name), 1 genuinely new customer (Big Bolt), 5
   ambiguous ties that the matcher safely FLAGS instead of guessing, 1 abbreviation miss (Manufacturing↔Mfg),
@@ -40,9 +45,15 @@ BC-side items (some now confirmed from the live probe on 2026-09-17):
 - ⚠️ **BC OData `$top` gotcha (bit us):** a small `$top` hard-caps the total AND suppresses `@odata.nextLink`,
   silently hiding the rest of a table. Always page via `nextLink` with no `$top`. (An earlier "only 1,000
   customers / looks like sandbox" reading was this bug, now fixed in verify.js + data-quality.js.)
-- ⛔ **REQUIRED (blocks Rule 2 for customer part numbers):** expose the **Item Reference** table
-  (customer part# → our item#). Standard API v2.0 does not expose it (`itemReferences`/
-  `itemCrossReferences` → 404). Needs a small custom API page or OData query endpoint.
+- ✅ **RESOLVED — Item References are reachable now, no admin work.** Standard API v2.0 does not expose
+  them (`itemReferences`/`itemCrossReferences` → 404; that's a missing *route*, not a permission issue —
+  it 404s for admins too). BUT BC already publishes the **`Item_References_Excel` OData web service**
+  (`/ODataV4/Company('Fasteners')/Item_References_Excel`): **44,720 customer-type refs** (customer part# →
+  our item#), 1,093+ distinct customers. Fields: `Item_No, Reference_Type, Reference_Type_No` (customer #),
+  `Reference_No` (customer's PN), `Unit_of_Measure`. Rule 2 cross-ref path can be built against this.
+  Caveats: some customer refs have a blank customer number; a junk test row exists.
+- Note: this endpoint is a **dev/test instance** (`BC260TEST` on `bp-nav-dev`, BC v26) holding a prod-like
+  restore (9,379 customers) — good for read-testing.
 - ℹ️ Resolved: **salesperson-code coverage is a non-issue** — only ~0.5% of active customers (43/9,283)
   carry a `salespersonCode`, but we route via a shared queue, not per salesperson. Dropped from scope.
 - ℹ️ Noted: `inventory` is a FlowField — cannot be `$filter`ed server-side (HTTP 400); read the item and

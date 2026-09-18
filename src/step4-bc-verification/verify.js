@@ -4,9 +4,10 @@
 //
 // v1 implements:
 //   Rule 1  Customer resolves            (fuzzy name/email match — best-effort, v1)
-//   Rule 2  Every line item resolves      (DIRECT path: part # -> items.number.
-//                                          Customer-part-number cross-reference path
-//                                          is BLOCKED until Item Reference is exposed.)
+//   Rule 2  Every line item resolves      (DIRECT: part # -> items.number, then
+//                                          CROSS-REF: customer part # -> our item #
+//                                          via the live Item_References_Excel OData
+//                                          service, narrowed to the resolved customer.)
 //   Rule 3  Every line in stock           (items.inventory >= quantity ordered)
 //   Rule 4  All-or-nothing across lines
 //
@@ -23,6 +24,10 @@ const USER = process.env.BC_USERNAME;
 const PASS = process.env.BC_PASSWORD;
 const COMPANY = process.env.BC_COMPANY;
 const AUTH = "Basic " + Buffer.from(`${USER}:${PASS}`).toString("base64");
+// Classic OData v4 web-services root (same server, /ODataV4 instead of /api/v2.0).
+// The standard API v2.0 does not expose item references; the published
+// `Item_References_Excel` page does (a LIVE view of the Item Reference table).
+const ODBASE = BASE.replace(/\/api\/v2\.0$/i, "/ODataV4");
 
 async function get(pathOrUrl) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${BASE}/${pathOrUrl}`;
@@ -92,30 +97,61 @@ async function checkCustomer(company, order, custCache) {
   return { rule: "1 customer", pass: true, detail: `resolved to ${top[0].number} (${top[0].displayName})`, match: top[0] };
 }
 
-// Rule 2 + 3 — per line: resolve item, then inventory ------------------------
-async function checkLine(company, line) {
+// Fetch one item record by our item number (for inventory/UoM after resolution).
+async function fetchItem(company, number) {
+  const r = await get(`companies(${company.id})/items?$filter=number eq ${odataStr(number)}&$select=number,displayName,inventory,blocked,baseUnitOfMeasureCode`);
+  return r.ok ? (r.json?.value || [])[0] : null;
+}
+
+// Cross-reference lookup against the LIVE Item_References_Excel OData service:
+// customer part # -> our item #. Prefers refs tied to the resolved customer.
+async function crossRefItems(company, custNo, partNo) {
+  const flt = `Reference_Type eq 'Customer' and Reference_No eq ${odataStr(partNo)}`;
+  const url = encodeURI(`${ODBASE}/Company(${odataStr(company.name)})/Item_References_Excel?$filter=${flt}&$select=Item_No,Reference_Type_No`);
+  const r = await get(url);
+  if (!r.ok) return { ok: false, status: r.status, items: [] };
+  let rows = r.json?.value || [];
+  if (custNo) { // narrow to this customer's own refs when we know who they are
+    const own = rows.filter((x) => (x.Reference_Type_No || "") === custNo);
+    if (own.length) rows = own;
+  }
+  const items = [...new Set(rows.map((x) => x.Item_No).filter(Boolean))];
+  return { ok: true, items };
+}
+
+// Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then inventory.
+async function checkLine(company, line, custNo) {
   const supplier = (line.supplier_part || "").trim();
   const customer = (line.customer_part || "").trim();
   const qty = line.quantity;
   const label = supplier || customer || line.description || `line ${line.line_no ?? "?"}`;
 
-  // Rule 2 — DIRECT path only. Try supplier PN, then customer PN, as our items.number.
+  // Rule 2, path (a) DIRECT — supplier PN, then customer PN, as our items.number.
   let item = null, via = null;
   for (const [pn, tag] of [[supplier, "supplier_part"], [customer, "customer_part"]]) {
     if (!pn) continue;
-    const r = await get(`companies(${company.id})/items?$filter=number eq ${odataStr(pn)}&$select=number,displayName,inventory,blocked,baseUnitOfMeasureCode`);
-    const hit = r.ok ? (r.json?.value || [])[0] : null;
+    const hit = await fetchItem(company, pn);
     if (hit) { item = hit; via = tag; break; }
   }
 
+  // Rule 2, path (b) CROSS-REFERENCE — customer part # via Item_References_Excel.
+  if (!item && customer) {
+    const cr = await crossRefItems(company, custNo, customer);
+    if (!cr.ok) {
+      return { label, pass: false, rule2: false, detail: `cross-ref lookup for "${customer}" failed (HTTP ${cr.status})` };
+    }
+    if (cr.items.length === 1) {
+      item = await fetchItem(company, cr.items[0]);
+      via = "cross-ref";
+    } else if (cr.items.length > 1) {
+      return { label, pass: false, rule2: false, detail: `customer part "${customer}" cross-refs to ${cr.items.length} items (${cr.items.slice(0, 4).join(", ")}) — ambiguous` };
+    }
+  }
+
   if (!item) {
-    // Distinguish "genuinely unknown" from "needs the cross-reference we can't reach yet".
-    const crossRefNeeded = !supplier && !!customer;
     return {
       label, pass: false, rule2: false,
-      detail: crossRefNeeded
-        ? `part "${customer}" is a CUSTOMER part number with no direct item match — needs Item Reference (BLOCKED: table not exposed by API v2.0)`
-        : `no BC item matches ${supplier ? `supplier part "${supplier}"` : `part "${customer}"`}`,
+      detail: `no BC item matches ${supplier ? `supplier part "${supplier}"` : `customer part "${customer}"`}${customer && !supplier ? " (no cross-reference either)" : ""}`,
     };
   }
 
@@ -141,8 +177,9 @@ export async function verifyOrder(order) {
   if (!custCache.ok) throw new Error(`customers read -> HTTP ${custCache.status}`);
 
   const r1 = await checkCustomer(company, order, custCache);
+  const custNo = r1.match?.number || null; // resolved customer #, sharpens cross-ref
   const lines = [];
-  for (const li of order.line_items || []) lines.push(await checkLine(company, li));
+  for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo));
 
   const linesPass = lines.length > 0 && lines.every((l) => l.pass);
   const approveReady = r1.pass && linesPass; // Rule 4 = all-or-nothing
@@ -213,7 +250,7 @@ async function batch(dir) {
   }
   console.log(`\n  Orders tested: ${orders}`);
   console.log(`  Rule 1 (customer) resolved: ${r1pass}/${orders}  (${orders ? ((r1pass / orders) * 100).toFixed(0) : 0}%)`);
-  console.log(`  Fully APPROVE-READY:        ${overallReady}/${orders}  (expected low — parts/stock not tuned, cross-ref path blocked)`);
+  console.log(`  Fully APPROVE-READY:        ${overallReady}/${orders}  (parts via direct + cross-ref; limited by unresolved customers, real stock-outs, UoM skips)`);
   console.log(`\n  Read-only. Overall-ready is NOT the metric here; Rule 1 hit-rate on real customer names is.`);
 }
 
