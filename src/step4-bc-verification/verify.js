@@ -283,17 +283,39 @@ export async function verifyOrder(order) {
   const lines = [];
   for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo));
 
-  const linesPass = lines.length > 0 && lines.every((l) => l.pass);
-  const approveReady = r1.pass && linesPass; // Rule 4 = all-or-nothing
-  return { company: company.name, rule1: r1, lines, linesPass, approveReady };
+  // Disposition: what document to create in BC (after a human approves).
+  //   Gates that force a human: customer not matched with high certainty, OR any
+  //   line not resolved to a BC item. Otherwise stock ROUTES the document type:
+  //   all lines in stock -> Order; any short line -> Quote (whole PO, option A).
+  const gateCustomer = r1.pass;
+  const resolved = lines.filter((l) => l.rule2).length;
+  const gateParts = lines.length > 0 && lines.every((l) => l.rule2);
+  const allInStock = gateParts && lines.every((l) => l.pass);
+  let disposition, dispositionReason;
+  if (lines.length === 0) {
+    disposition = "review"; dispositionReason = "no line items extracted";
+  } else if (!gateCustomer && !gateParts) {
+    disposition = "review"; dispositionReason = `customer not confidently matched, and ${lines.length - resolved} line(s) unresolved`;
+  } else if (!gateCustomer) {
+    disposition = "review"; dispositionReason = `customer not confidently matched — ${r1.detail}`;
+  } else if (!gateParts) {
+    disposition = "review"; dispositionReason = `${lines.length - resolved} of ${lines.length} line(s) not matched to a BC item`;
+  } else if (allInStock) {
+    disposition = "order"; dispositionReason = "customer matched; all lines in stock";
+  } else {
+    disposition = "quote"; dispositionReason = "customer matched; one or more lines not in stock → quote";
+  }
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason };
 }
+
+const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };
 
 function printReport(order, res) {
   console.log(`\nOrder: PO ${order.po_number ?? "?"} — customer "${order?.customer?.name ?? "?"}"  [company: ${res.company}]`);
-  console.log(`  Rule 1 (customer):   ${res.rule1.pass ? "PASS" : "FLAG"} — ${res.rule1.detail}`);
-  console.log(`  Rule 2+3 (lines):    ${res.linesPass ? "PASS" : "FLAG"}`);
-  for (const l of res.lines) console.log(`     - ${l.pass ? "ok  " : "FLAG"} ${l.detail}`);
-  console.log(`  ── Overall: ${res.approveReady ? "✅ APPROVE-READY" : "⛔ FLAGGED for a rep"}`);
+  console.log(`  Customer:  ${res.rule1.pass ? "matched" : "NOT matched"} — ${res.rule1.detail}`);
+  console.log(`  Lines:`);
+  for (const l of res.lines) console.log(`     - ${l.pass ? "in stock " : l.rule2 ? "short    " : "no match "} ${l.detail}`);
+  console.log(`  ── ${DISPO[res.disposition]} — ${res.dispositionReason}`);
 }
 
 // --- selftest: build should-pass / should-flag orders from live BC ----------
@@ -320,7 +342,7 @@ async function selftest() {
   };
   printReport(passOrder, await verifyOrder(passOrder));
   printReport(flagOrder, await verifyOrder(flagOrder));
-  console.log("\nSelftest done (read-only). Expect: first APPROVE-READY, second FLAGGED.");
+  console.log("\nSelftest done (read-only). Expect: first CREATE AS ORDER, second NEEDS REVIEW (unresolved line).");
 }
 
 // Accept either a raw order (Step-2 shape) or an answer-key wrapper {extraction, ...}.
@@ -329,12 +351,13 @@ const unwrap = (j) => (j && j.extraction ? j.extraction : j);
 // --- batch: run every order-classified file in a dir, focus on Rule 1 -------
 async function batch(dir, jsonOut) {
   const files = readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
-  let orders = 0, r1pass = 0, overallReady = 0;
+  let orders = 0;
+  const tally = { order: 0, quote: 0, review: 0 };
   const records = [];
   if (!jsonOut) {
-    console.log(`Batch over ${dir} — Rule 1 (customer match) focus:\n`);
-    console.log("  sample  R1    lines        overall            customer / detail");
-    console.log("  ------  ----  -----------  -----------------  -----------------");
+    console.log(`Batch over ${dir} — disposition (Order / Quote / Needs-review):\n`);
+    console.log("  sample  disposition       customer -> detail");
+    console.log("  ------  ----------------  ------------------");
   }
   for (const f of files) {
     const raw = JSON.parse(readFileSync(join(dir, f), "utf8"));
@@ -344,12 +367,10 @@ async function batch(dir, jsonOut) {
     let res;
     try { res = await verifyOrder(order); }
     catch (e) {
-      if (!jsonOut) console.log(`  ${(raw.sample_id || f).padEnd(6)}  ERR   —            —                  ${e.message}`);
+      if (!jsonOut) console.log(`  ${(raw.sample_id || f).padEnd(6)}  ERR               ${e.message}`);
       continue;
     }
-    if (res.rule1.pass) r1pass++;
-    if (res.approveReady) overallReady++;
-    const nOk = res.lines.filter((l) => l.pass).length;
+    tally[res.disposition]++;
     const id = (raw.sample_id || f).replace(/\.json$/, "");
     // Structured record (order fields + verification) for the review UI / future app.
     records.push({
@@ -358,23 +379,22 @@ async function batch(dir, jsonOut) {
       customer: order.customer, ship_to: order.ship_to,
       line_items: order.line_items, company: res.company,
       rule1: res.rule1, lines: res.lines, linesPass: res.linesPass,
-      approveReady: res.approveReady,
+      disposition: res.disposition, dispositionReason: res.dispositionReason,
     });
-    if (!jsonOut) console.log(
-      `  ${id.padEnd(6)}  ${(res.rule1.pass ? "PASS" : "FLAG")}  ${`${nOk}/${res.lines.length} ok`.padEnd(11)}  ` +
-      `${(res.approveReady ? "APPROVE-READY" : "flagged").padEnd(17)}  ${res.rule1.detail}`
-    );
+    const label = { order: "ORDER (in stock)", quote: "QUOTE (short)", review: "needs review" }[res.disposition];
+    if (!jsonOut) console.log(`  ${id.padEnd(6)}  ${label.padEnd(16)}  ${res.dispositionReason}`);
   }
   if (jsonOut) {
     const { writeFileSync } = await import("node:fs");
-    writeFileSync(jsonOut, JSON.stringify({ generated: new Date().toISOString(), orders, r1pass, overallReady, records }, null, 2));
+    writeFileSync(jsonOut, JSON.stringify({ generated: new Date().toISOString(), orders, tally, records }, null, 2));
     console.log(`Wrote ${records.length} verified orders -> ${jsonOut}`);
     return;
   }
-  console.log(`\n  Orders tested: ${orders}`);
-  console.log(`  Rule 1 (customer) resolved: ${r1pass}/${orders}  (${orders ? ((r1pass / orders) * 100).toFixed(0) : 0}%)`);
-  console.log(`  Fully APPROVE-READY:        ${overallReady}/${orders}  (parts via direct + cross-ref; limited by unresolved customers, real stock-outs, UoM skips)`);
-  console.log(`\n  Read-only. Overall-ready is NOT the metric here; Rule 1 hit-rate on real customer names is.`);
+  console.log(`\n  Orders: ${orders}`);
+  console.log(`  → Create as ORDER (all in stock):   ${tally.order}`);
+  console.log(`  → Create as QUOTE (some short):     ${tally.quote}`);
+  console.log(`  → NEEDS REVIEW (customer/parts):    ${tally.review}`);
+  console.log(`\n  Read-only. Disposition = what would be created after a human approves.`);
 }
 
 async function main() {
