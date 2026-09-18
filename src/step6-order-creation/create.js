@@ -83,7 +83,7 @@ function buildDoc(order, res) {
   return { docType: res.disposition, ent, lineEnt, header, lines };
 }
 
-async function run({ orderPath, doCreate, targetCompany }) {
+async function run({ orderPath, doCreate, targetCompany, manualNumber }) {
   const order = unwrap(JSON.parse(readFileSync(orderPath, "utf8")));
   const res = await verifyOrder(order);
 
@@ -97,10 +97,19 @@ async function run({ orderPath, doCreate, targetCompany }) {
   const company = await resolveCompany();           // read-only
   const doc = buildDoc(order, res);
   const prefix = SERIES[doc.docType];
-  const num = await nextNumber(company, doc.ent, prefix); // read-only: BC is the source of truth
-  doc.header.number = num.format(num.next);
 
-  console.log(`\n  Would POST ${doc.ent} (number ${doc.header.number}, series ${prefix}):`);
+  // Default: let BC assign the number. With the "Email Order No. Series" AL subscriber
+  // in place (keyed to the EMAILORDER user), BC stamps S-ORD-EMAIL / S-QUO-EMAIL and
+  // owns the sequence — the regular order/quote series are untouched. The manual path
+  // (--manual-number) is only for setups that allow Manual Nos. on the default series.
+  let num = null;
+  if (manualNumber) {
+    num = await nextNumber(company, doc.ent, prefix); // read-only: BC is the source of truth
+    doc.header.number = num.format(num.next);
+    console.log(`\n  Would POST ${doc.ent} (manual number ${doc.header.number}, series ${prefix}):`);
+  } else {
+    console.log(`\n  Would POST ${doc.ent} (number assigned by BC — ${prefix} via the EMAILORDER subscriber):`);
+  }
   console.log("    " + JSON.stringify(doc.header));
   console.log(`  then POST ${doc.lineEnt} ×${doc.lines.length}:`);
   doc.lines.forEach((l) => console.log("    " + JSON.stringify(l)));
@@ -118,19 +127,26 @@ async function run({ orderPath, doCreate, targetCompany }) {
   }
   console.log(`\n  Writing to "${company.name}" (id ${company.id}) ...`);
 
-  // Assign the number; retry on collision (another doc grabbed it between read & write).
-  let n = num.next, hdr, docId, number, ok = false;
-  for (let attempt = 0; attempt < 6 && !ok; attempt++) {
-    const body = { ...doc.header, number: num.format(n) };
-    hdr = await api("POST", `companies(${company.id})/${doc.ent}`, body);
-    if (hdr.ok) { ok = true; docId = hdr.json?.id; number = hdr.json?.number; break; }
-    const msg = hdr.text || "";
-    if (/exist|already|duplicat|primary key/i.test(msg)) { n++; continue; } // number taken → try next
-    console.error(`  header POST failed HTTP ${hdr.status}: ${msg.slice(0, 500)}`);
-    if (/manual/i.test(msg)) console.error(`  → The "${prefix}" series likely needs Manual Nos. = Yes in BC (No. Series setup).`);
-    process.exit(1);
+  let hdr, docId, number;
+  if (manualNumber) {
+    // Assign the number; retry on collision (another doc grabbed it between read & write).
+    let n = num.next, ok = false;
+    for (let attempt = 0; attempt < 6 && !ok; attempt++) {
+      hdr = await api("POST", `companies(${company.id})/${doc.ent}`, { ...doc.header, number: num.format(n) });
+      if (hdr.ok) { ok = true; break; }
+      const msg = hdr.text || "";
+      if (/exist|already|duplicat|primary key/i.test(msg)) { n++; continue; }
+      console.error(`  header POST failed HTTP ${hdr.status}: ${msg.slice(0, 500)}`);
+      if (/manual/i.test(msg)) console.error(`  → Manual Nos. is not enabled on the default series. Prefer the AL subscriber instead (no series changes).`);
+      process.exit(1);
+    }
+    if (!ok) { console.error("  Could not assign a free number after several attempts."); process.exit(1); }
+  } else {
+    // BC (via the EMAILORDER subscriber) assigns the number from the email series.
+    hdr = await api("POST", `companies(${company.id})/${doc.ent}`, doc.header);
+    if (!hdr.ok) { console.error(`  header POST failed HTTP ${hdr.status}: ${(hdr.text || "").slice(0, 500)}`); process.exit(1); }
   }
-  if (!ok) { console.error("  Could not assign a free number after several attempts."); process.exit(1); }
+  docId = hdr.json?.id; number = hdr.json?.number;
   console.log(`  created ${doc.docType} ${number} (id ${docId})`);
   for (const line of doc.lines) {
     const lr = await api("POST", `companies(${company.id})/${doc.ent}(${docId})/${doc.lineEnt}`, line);
@@ -151,8 +167,9 @@ function main() {
     return;
   }
   const doCreate = args.includes("--create");
+  const manualNumber = args.includes("--manual-number");
   const targetCompany = args.indexOf("--company") !== -1 ? args[args.indexOf("--company") + 1] : null;
-  return run({ orderPath, doCreate, targetCompany });
+  return run({ orderPath, doCreate, targetCompany, manualNumber });
 }
 
 main();
