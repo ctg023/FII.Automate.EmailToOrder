@@ -69,6 +69,22 @@ async function nextNumber(company, ent, prefix) {
   return { next: last + 1, format: fmt };
 }
 
+// Duplicate-PO guard: has this PO already been turned into a doc for this customer?
+// Checks open orders, open quotes, and posted invoices for the same
+// externalDocumentNumber + customerNumber. Returns any matches found.
+async function findDuplicates(company, custNumber, poNumber) {
+  if (!custNumber || !poNumber) return [];
+  const po = String(poNumber).replace(/'/g, "''");
+  const cust = String(custNumber).replace(/'/g, "''");
+  const filter = `externalDocumentNumber eq '${po}' and customerNumber eq '${cust}'`;
+  const out = [];
+  for (const ent of ["salesOrders", "salesQuotes", "salesInvoices"]) {
+    const r = await api("GET", encodeURI(`companies(${company.id})/${ent}?$filter=${filter}&$select=number,status`));
+    if (r.ok) for (const d of (r.json?.value || [])) out.push({ ent, number: d.number, status: d.status });
+  }
+  return out;
+}
+
 // Build the BC document (header + lines) from a verified order.
 function buildDoc(order, res) {
   const header = { customerNumber: res.rule1.match?.number };
@@ -85,7 +101,7 @@ function buildDoc(order, res) {
   return { docType: res.disposition, ent, lineEnt, header, lines };
 }
 
-async function run({ orderPath, doCreate, targetCompany, manualNumber }) {
+async function run({ orderPath, doCreate, targetCompany, manualNumber, allowDuplicate }) {
   const order = unwrap(JSON.parse(readFileSync(orderPath, "utf8")));
   const res = await verifyOrder(order);
 
@@ -116,6 +132,15 @@ async function run({ orderPath, doCreate, targetCompany, manualNumber }) {
   console.log(`  then POST ${doc.lineEnt} ×${doc.lines.length}:`);
   doc.lines.forEach((l) => console.log("    " + JSON.stringify(l)));
 
+  // Duplicate-PO guard (read-only) — surface any existing doc for this PO + customer.
+  const dups = await findDuplicates(company, res.rule1.match?.number, order.po_number);
+  if (dups.length) {
+    console.log(`\n  ⚠ DUPLICATE CHECK — PO "${order.po_number}" already exists for customer ${res.rule1.match?.number}:`);
+    dups.forEach((d) => console.log(`     - ${d.ent} ${d.number}${d.status ? ` [${d.status}]` : ""}`));
+  } else {
+    console.log(`\n  Duplicate check: none found for PO "${order.po_number}" / customer ${res.rule1.match?.number}.`);
+  }
+
   if (!doCreate) {
     console.log("\n  DRY RUN — nothing written to BC. Re-run with --create --company \"<sandbox>\" to write.");
     return;
@@ -125,6 +150,11 @@ async function run({ orderPath, doCreate, targetCompany, manualNumber }) {
   if (!targetCompany || targetCompany.toLowerCase() !== company.name.toLowerCase()) {
     console.error(`\n  REFUSING TO WRITE: --company must exactly match the target company.`);
     console.error(`  Resolved company is "${company.name}". Pass --company "${company.name}" to confirm you intend to write there.`);
+    process.exit(1);
+  }
+  if (dups.length && !allowDuplicate) {
+    console.error(`\n  REFUSING TO WRITE: PO "${order.po_number}" already exists in BC (see duplicate check above).`);
+    console.error(`  Re-run with --allow-duplicate to create it anyway.`);
     process.exit(1);
   }
   console.log(`\n  Writing to "${company.name}" (id ${company.id}) ...`);
@@ -172,8 +202,9 @@ function main() {
   }
   const doCreate = args.includes("--create");
   const manualNumber = args.includes("--manual-number");
+  const allowDuplicate = args.includes("--allow-duplicate");
   const targetCompany = args.indexOf("--company") !== -1 ? args[args.indexOf("--company") + 1] : null;
-  return run({ orderPath, doCreate, targetCompany, manualNumber });
+  return run({ orderPath, doCreate, targetCompany, manualNumber, allowDuplicate });
 }
 
 main();
