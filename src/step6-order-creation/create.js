@@ -73,7 +73,9 @@ async function nextNumber(company, ent, prefix) {
 function buildDoc(order, res) {
   const header = { customerNumber: res.rule1.match?.number };
   if (order.po_number) header.externalDocumentNumber = String(order.po_number).slice(0, 35);
-  if (isISO(order.order_date)) header.orderDate = order.order_date.slice(0, 10);
+  // Sales orders use `orderDate`; sales quotes use `documentDate`.
+  const dateField = res.disposition === "order" ? "orderDate" : "documentDate";
+  if (isISO(order.order_date)) header[dateField] = order.order_date.slice(0, 10);
   if (isISO(order.requested_ship_date)) header.requestedDeliveryDate = order.requested_ship_date.slice(0, 10);
   const lines = res.lines
     .map((l, i) => ({ lineType: "Item", lineObjectNumber: l.item, quantity: order.line_items?.[i]?.quantity }))
@@ -129,18 +131,20 @@ async function run({ orderPath, doCreate, targetCompany, manualNumber }) {
 
   let hdr, docId, number;
   if (manualNumber) {
-    // Assign the number; retry on collision (another doc grabbed it between read & write).
-    let n = num.next, ok = false;
+    // Assign the number; retry only on a genuine "number already used" collision.
+    let n = num.next, ok = false, lastMsg = "";
     for (let attempt = 0; attempt < 6 && !ok; attempt++) {
       hdr = await api("POST", `companies(${company.id})/${doc.ent}`, { ...doc.header, number: num.format(n) });
       if (hdr.ok) { ok = true; break; }
-      const msg = hdr.text || "";
-      if (/exist|already|duplicat|primary key/i.test(msg)) { n++; continue; }
-      console.error(`  header POST failed HTTP ${hdr.status}: ${msg.slice(0, 500)}`);
-      if (/manual/i.test(msg)) console.error(`  → Manual Nos. is not enabled on the default series. Prefer the AL subscriber instead (no series changes).`);
+      lastMsg = hdr.text || "";
+      // Narrow: only a real duplicate-key collision should trigger a retry with the next number.
+      if (/already exists|already in use|duplicate|primary key/i.test(lastMsg)) { n++; continue; }
+      // Any other error is real — print it and stop.
+      console.error(`  header POST failed HTTP ${hdr.status}: ${lastMsg.slice(0, 600)}`);
+      if (/manual/i.test(lastMsg)) console.error(`  → Manual Nos. isn't enabled on the default series this doc uses (Quote Nos. for quotes). Enable it, or use the AL subscriber.`);
       process.exit(1);
     }
-    if (!ok) { console.error("  Could not assign a free number after several attempts."); process.exit(1); }
+    if (!ok) { console.error(`  Gave up after retries. Last error HTTP ${hdr?.status}: ${lastMsg.slice(0, 600)}`); process.exit(1); }
   } else {
     // BC (via the EMAILORDER subscriber) assigns the number from the email series.
     hdr = await api("POST", `companies(${company.id})/${doc.ent}`, doc.header);
