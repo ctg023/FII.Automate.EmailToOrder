@@ -14,7 +14,7 @@ end-to-end** against live BC (selftest: clean order → APPROVE-READY, bad line 
 | 3 | Test order / not-order / unsure classification | ✅ Done — 92% (46/50); **order recall 100%, 0 missed orders**; errors only on not_order↔unsure boundary. Harness in `src/step3-classification/`, ~$0.41/run on Opus. Labels S24–S50 are drafted (verified:false) |
 | 4 | Confirm BC prerequisites + build read-only verification checks | 🟡 In progress — connectivity proven (`ping.js`), data-quality probed (`data-quality.js`), **v1 rules cataloged (`VERIFICATION-RULES.md`) and running (`verify.js`)**. One BC-side blocker: Item Reference table not exposed (see below) |
 | 5 | Review-queue web app (Teams tab) | Later |
-| 6 | Order creation against BC sandbox | Later |
+| 6 | Order creation against BC sandbox | 🟡 **First write PROVEN** — `create.js` created Sales Order 231175 in Fasteners from S01 (customer 91333700, PO 114543, `SN 1409`×11000 PCS, $697.40, open/not released) via the dedicated **EMAILORDER** service user (SUPER). Dry-run by default; write is double-guarded (`--create`+`--company`). Pending: BC `OnBeforeInsert` subscriber (keyed to EMAILORDER) to apply the **S-ORD-EMAIL / S-QUO-EMAIL** number series; duplicate-PO guard; quote path live-tested |
 | 7 | Pilot with 1–2 reps | Later |
 
 ## Settled decisions
