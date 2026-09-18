@@ -43,6 +43,32 @@ async function resolveCompany() {
 const isISO = (s) => /^\d{4}-\d{2}-\d{2}/.test(s || "");
 const unwrap = (j) => (j && j.extraction ? j.extraction : j);
 
+// Email-app number series (assigned manually by this app; BC series must have
+// Manual Nos. = Yes). Format: <PREFIX><zero-padded counter>, e.g. S-ORD-EMAIL00001.
+const SERIES = { order: "S-ORD-EMAIL", quote: "S-QUO-EMAIL" };
+const NUM_PAD = 5;
+
+// Next number for a series: BC is the source of truth — find the highest existing
+// document number with this prefix and add one. (No fragile local counter to drift.)
+async function nextNumber(company, ent, prefix) {
+  const fmt = (n) => `${prefix}${String(n).padStart(NUM_PAD, "0")}`;
+  let last = 0;
+  const url = encodeURI(`companies(${company.id})/${ent}?$filter=startswith(number,'${prefix}')&$select=number&$orderby=number desc&$top=1`);
+  const r = await api("GET", url);
+  if (r.ok) {
+    const row = (r.json?.value || [])[0];
+    if (row) { const m = String(row.number).match(/(\d+)\s*$/); if (m) last = parseInt(m[1], 10); }
+  } else {
+    // Fallback if $filter/startswith is rejected: scan a page and match client-side.
+    const r2 = await api("GET", `companies(${company.id})/${ent}?$select=number&$top=5000`);
+    for (const x of (r2.json?.value || [])) {
+      const n = String(x.number);
+      if (n.startsWith(prefix)) { const m = n.match(/(\d+)\s*$/); if (m) last = Math.max(last, parseInt(m[1], 10)); }
+    }
+  }
+  return { next: last + 1, format: fmt };
+}
+
 // Build the BC document (header + lines) from a verified order.
 function buildDoc(order, res) {
   const header = { customerNumber: res.rule1.match?.number };
@@ -68,8 +94,13 @@ async function run({ orderPath, doCreate, targetCompany }) {
     return;
   }
 
+  const company = await resolveCompany();           // read-only
   const doc = buildDoc(order, res);
-  console.log(`\n  Would POST ${doc.ent}:`);
+  const prefix = SERIES[doc.docType];
+  const num = await nextNumber(company, doc.ent, prefix); // read-only: BC is the source of truth
+  doc.header.number = num.format(num.next);
+
+  console.log(`\n  Would POST ${doc.ent} (number ${doc.header.number}, series ${prefix}):`);
   console.log("    " + JSON.stringify(doc.header));
   console.log(`  then POST ${doc.lineEnt} ×${doc.lines.length}:`);
   doc.lines.forEach((l) => console.log("    " + JSON.stringify(l)));
@@ -80,22 +111,32 @@ async function run({ orderPath, doCreate, targetCompany }) {
   }
 
   // --- guarded real write (sandbox only) ---
-  const company = await resolveCompany();
   if (!targetCompany || targetCompany.toLowerCase() !== company.name.toLowerCase()) {
     console.error(`\n  REFUSING TO WRITE: --company must exactly match the target company.`);
     console.error(`  Resolved company is "${company.name}". Pass --company "${company.name}" to confirm you intend to write there.`);
     process.exit(1);
   }
   console.log(`\n  Writing to "${company.name}" (id ${company.id}) ...`);
-  const hdr = await api("POST", `companies(${company.id})/${doc.ent}`, doc.header);
-  if (!hdr.ok) { console.error(`  header POST failed HTTP ${hdr.status}: ${(hdr.text || "").slice(0, 400)}`); process.exit(1); }
-  const docId = hdr.json?.id, number = hdr.json?.number;
-  console.log(`  created ${doc.docType} ${number ?? ""} (id ${docId})`);
+
+  // Assign the number; retry on collision (another doc grabbed it between read & write).
+  let n = num.next, hdr, docId, number, ok = false;
+  for (let attempt = 0; attempt < 6 && !ok; attempt++) {
+    const body = { ...doc.header, number: num.format(n) };
+    hdr = await api("POST", `companies(${company.id})/${doc.ent}`, body);
+    if (hdr.ok) { ok = true; docId = hdr.json?.id; number = hdr.json?.number; break; }
+    const msg = hdr.text || "";
+    if (/exist|already|duplicat|primary key/i.test(msg)) { n++; continue; } // number taken → try next
+    console.error(`  header POST failed HTTP ${hdr.status}: ${msg.slice(0, 500)}`);
+    if (/manual/i.test(msg)) console.error(`  → The "${prefix}" series likely needs Manual Nos. = Yes in BC (No. Series setup).`);
+    process.exit(1);
+  }
+  if (!ok) { console.error("  Could not assign a free number after several attempts."); process.exit(1); }
+  console.log(`  created ${doc.docType} ${number} (id ${docId})`);
   for (const line of doc.lines) {
     const lr = await api("POST", `companies(${company.id})/${doc.ent}(${docId})/${doc.lineEnt}`, line);
     console.log(`    line ${line.lineObjectNumber} x${line.quantity} -> HTTP ${lr.status}${lr.ok ? " ok" : " FAILED: " + (lr.text || "").slice(0, 200)}`);
   }
-  console.log(`  Done. Review ${doc.docType} ${number ?? docId} in BC (created open, not released).`);
+  console.log(`  Done. Review ${doc.docType} ${number} in BC (created open, not released).`);
 }
 
 function main() {
