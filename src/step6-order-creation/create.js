@@ -43,31 +43,9 @@ async function resolveCompany() {
 const isISO = (s) => /^\d{4}-\d{2}-\d{2}/.test(s || "");
 const unwrap = (j) => (j && j.extraction ? j.extraction : j);
 
-// Email-app number series (assigned manually by this app; BC series must have
-// Manual Nos. = Yes). Format: <PREFIX><zero-padded counter>, e.g. S-ORD-EMAIL00001.
-const SERIES = { order: "S-ORD-EMAIL", quote: "S-QUO-EMAIL" };
-const NUM_PAD = 5;
-
-// Next number for a series: BC is the source of truth — find the highest existing
-// document number with this prefix and add one. (No fragile local counter to drift.)
-async function nextNumber(company, ent, prefix) {
-  const fmt = (n) => `${prefix}${String(n).padStart(NUM_PAD, "0")}`;
-  let last = 0;
-  const url = encodeURI(`companies(${company.id})/${ent}?$filter=startswith(number,'${prefix}')&$select=number&$orderby=number desc&$top=1`);
-  const r = await api("GET", url);
-  if (r.ok) {
-    const row = (r.json?.value || [])[0];
-    if (row) { const m = String(row.number).match(/(\d+)\s*$/); if (m) last = parseInt(m[1], 10); }
-  } else {
-    // Fallback if $filter/startswith is rejected: scan a page and match client-side.
-    const r2 = await api("GET", `companies(${company.id})/${ent}?$select=number&$top=5000`);
-    for (const x of (r2.json?.value || [])) {
-      const n = String(x.number);
-      if (n.startsWith(prefix)) { const m = n.match(/(\d+)\s*$/); if (m) last = Math.max(last, parseInt(m[1], 10)); }
-    }
-  }
-  return { next: last + 1, format: fmt };
-}
+// Numbering is owned entirely by BC: the "Email Order No. Series" AL subscriber
+// (keyed to the EMAILORDER user) stamps S-ORD-EMAIL / S-QUO-EMAIL on API-created
+// docs. This tool posts WITHOUT a number and never manages a sequence.
 
 // Duplicate-PO guard: has this PO already been turned into a doc for this customer?
 // Checks open orders, open quotes, and posted invoices for the same
@@ -101,7 +79,7 @@ function buildDoc(order, res) {
   return { docType: res.disposition, ent, lineEnt, header, lines };
 }
 
-async function run({ orderPath, doCreate, targetCompany, manualNumber, allowDuplicate }) {
+async function run({ orderPath, doCreate, targetCompany, allowDuplicate }) {
   const order = unwrap(JSON.parse(readFileSync(orderPath, "utf8")));
   const res = await verifyOrder(order);
 
@@ -114,20 +92,9 @@ async function run({ orderPath, doCreate, targetCompany, manualNumber, allowDupl
 
   const company = await resolveCompany();           // read-only
   const doc = buildDoc(order, res);
-  const prefix = SERIES[doc.docType];
 
-  // Default: let BC assign the number. With the "Email Order No. Series" AL subscriber
-  // in place (keyed to the EMAILORDER user), BC stamps S-ORD-EMAIL / S-QUO-EMAIL and
-  // owns the sequence — the regular order/quote series are untouched. The manual path
-  // (--manual-number) is only for setups that allow Manual Nos. on the default series.
-  let num = null;
-  if (manualNumber) {
-    num = await nextNumber(company, doc.ent, prefix); // read-only: BC is the source of truth
-    doc.header.number = num.format(num.next);
-    console.log(`\n  Would POST ${doc.ent} (manual number ${doc.header.number}, series ${prefix}):`);
-  } else {
-    console.log(`\n  Would POST ${doc.ent} (number assigned by BC — ${prefix} via the EMAILORDER subscriber):`);
-  }
+  // BC assigns the number via the "Email Order No. Series" subscriber (EMAILORDER user).
+  console.log(`\n  Would POST ${doc.ent} (number assigned by BC — Email Order No. Series subscriber):`);
   console.log("    " + JSON.stringify(doc.header));
   console.log(`  then POST ${doc.lineEnt} ×${doc.lines.length}:`);
   doc.lines.forEach((l) => console.log("    " + JSON.stringify(l)));
@@ -159,28 +126,9 @@ async function run({ orderPath, doCreate, targetCompany, manualNumber, allowDupl
   }
   console.log(`\n  Writing to "${company.name}" (id ${company.id}) ...`);
 
-  let hdr, docId, number;
-  if (manualNumber) {
-    // Assign the number; retry only on a genuine "number already used" collision.
-    let n = num.next, ok = false, lastMsg = "";
-    for (let attempt = 0; attempt < 6 && !ok; attempt++) {
-      hdr = await api("POST", `companies(${company.id})/${doc.ent}`, { ...doc.header, number: num.format(n) });
-      if (hdr.ok) { ok = true; break; }
-      lastMsg = hdr.text || "";
-      // Narrow: only a real duplicate-key collision should trigger a retry with the next number.
-      if (/already exists|already in use|duplicate|primary key/i.test(lastMsg)) { n++; continue; }
-      // Any other error is real — print it and stop.
-      console.error(`  header POST failed HTTP ${hdr.status}: ${lastMsg.slice(0, 600)}`);
-      if (/manual/i.test(lastMsg)) console.error(`  → Manual Nos. isn't enabled on the default series this doc uses (Quote Nos. for quotes). Enable it, or use the AL subscriber.`);
-      process.exit(1);
-    }
-    if (!ok) { console.error(`  Gave up after retries. Last error HTTP ${hdr?.status}: ${lastMsg.slice(0, 600)}`); process.exit(1); }
-  } else {
-    // BC (via the EMAILORDER subscriber) assigns the number from the email series.
-    hdr = await api("POST", `companies(${company.id})/${doc.ent}`, doc.header);
-    if (!hdr.ok) { console.error(`  header POST failed HTTP ${hdr.status}: ${(hdr.text || "").slice(0, 500)}`); process.exit(1); }
-  }
-  docId = hdr.json?.id; number = hdr.json?.number;
+  const hdr = await api("POST", `companies(${company.id})/${doc.ent}`, doc.header);
+  if (!hdr.ok) { console.error(`  header POST failed HTTP ${hdr.status}: ${(hdr.text || "").slice(0, 500)}`); process.exit(1); }
+  const docId = hdr.json?.id, number = hdr.json?.number;
   console.log(`  created ${doc.docType} ${number} (id ${docId})`);
   for (const line of doc.lines) {
     const lr = await api("POST", `companies(${company.id})/${doc.ent}(${docId})/${doc.lineEnt}`, line);
@@ -201,10 +149,9 @@ function main() {
     return;
   }
   const doCreate = args.includes("--create");
-  const manualNumber = args.includes("--manual-number");
   const allowDuplicate = args.includes("--allow-duplicate");
   const targetCompany = args.indexOf("--company") !== -1 ? args[args.indexOf("--company") + 1] : null;
-  return run({ orderPath, doCreate, targetCompany, manualNumber, allowDuplicate });
+  return run({ orderPath, doCreate, targetCompany, allowDuplicate });
 }
 
 main();
