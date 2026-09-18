@@ -108,9 +108,30 @@ async function resolveCompany() {
   return c;
 }
 
+// Rank the closest BC customers to an order name — for the review-card pick-list
+// when we can't confidently auto-resolve. Ranks by shared whole-word tokens, then
+// ship-to geo match, then closeness (fewest extra words in the candidate).
+function suggestCustomers(order, wantTokens, rows, limit = 3) {
+  if (!wantTokens.length) return [];
+  const oCity = normGeo(order?.ship_to?.city), oState = normGeo(order?.ship_to?.state);
+  const need = Math.max(1, Math.ceil(wantTokens.length / 2)); // at least half the order's words
+  const scored = [];
+  for (const c of rows) {
+    const ct = tokenize(c.displayName);
+    const set = new Set(ct);
+    const shared = wantTokens.filter((t) => set.has(t)).length;
+    if (shared < need) continue;
+    const geo = !!oCity && normGeo(c.city) === oCity && (!oState || normGeo(c.state) === oState);
+    scored.push({ number: c.number, displayName: c.displayName, city: c.city, state: c.state, shared, of: wantTokens.length, geo, extra: ct.length - shared });
+  }
+  scored.sort((a, b) => b.shared - a.shared || (b.geo - a.geo) || a.extra - b.extra);
+  return scored.slice(0, limit);
+}
+
 // Rule 1 — customer resolves ------------------------------------------------
 // A candidate qualifies iff it contains ALL order name tokens (whole words).
 // Exact normalized-name match takes precedence; ties broken by ship-to geo.
+// On any non-resolve, attach `suggestions` (top near-matches) for a human to pick.
 async function checkCustomer(company, order, custCache) {
   const wantName = normName(order?.customer?.name);
   const wantTokens = tokenize(order?.customer?.name);
@@ -131,7 +152,7 @@ async function checkCustomer(company, order, custCache) {
   let pool = exact.length ? exact : subset;
   const via = exact.length ? "exact name" : "all-tokens";
   if (pool.length === 0) {
-    return { rule: "1 customer", pass: false, detail: `no BC customer matches "${order?.customer?.name}"` };
+    return { rule: "1 customer", pass: false, detail: `no exact BC customer for "${order?.customer?.name}"`, suggestions: suggestCustomers(order, wantTokens, custCache.rows) };
   }
 
   // Tie-break on ship-to city/state when several candidates qualify.
@@ -144,7 +165,8 @@ async function checkCustomer(company, order, custCache) {
     }
   }
   if (pool.length > 1) {
-    return { rule: "1 customer", pass: false, detail: `ambiguous — ${pool.length} customers tie (${pool.slice(0, 6).map((t) => t.number).join(", ")}${pool.length > 6 ? ", …" : ""})`, candidates: pool };
+    const suggestions = pool.slice(0, 4).map((c) => ({ ...c, shared: wantTokens.length, of: wantTokens.length, geo: normGeo(c.city) === normGeo(order?.ship_to?.city) }));
+    return { rule: "1 customer", pass: false, detail: `ambiguous — ${pool.length} customers match; pick one`, suggestions };
   }
   return { rule: "1 customer", pass: true, detail: `resolved to ${pool[0].number} (${pool[0].displayName}) [via ${via}${brokeBy ? ` + ${brokeBy}` : ""}]`, match: pool[0] };
 }
