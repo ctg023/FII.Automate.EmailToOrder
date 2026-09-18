@@ -26,7 +26,12 @@ orders are NOT routed per salesperson** (so customer `salespersonCode` coverage 
 **no auto-create: clean orders are staged approve-ready, a human always clicks Approve through rollout** ·
 **mailbox is READ-ONLY — never mark-read / move / delete / flag the production `orders@` mailbox** (Graph
 `Mail.Read.Shared` only). Consequence: the pipeline must track already-processed emails in its OWN state
-store (keyed by Graph message-id), since we can't move or flag them to mark "done".
+store (keyed by Graph message-id), since we can't move or flag them to mark "done" ·
+**scope = clean the PO + get it into BC as the right document** (NOT replicating the 10 ARC web-order
+auto-release rules — those were reviewed and set aside). Two gates need a human: (1) customer not matched
+with high certainty, (2) any line not resolved to a BC item. Otherwise **stock routes the document type:
+all lines in stock → Order; any short line → whole PO as a Quote** (option A). Actual create stays a later,
+human-approved, sandbox-first write.
 
 ## Recommended (not yet confirmed — decide at review-app stage)
 - **Web app hosting:** IIS reverse proxy → standalone Node Windows service (not `iisnode`). Fallback: Node serves HTTPS directly.
