@@ -125,6 +125,33 @@ async function cmdPull(limit, outDir) {
   if (outDir) console.log(`  Records written to ${outDir}/`);
 }
 
+// Diagnostic: is Graph access already set up? Reports each step and what a failure means.
+async function cmdCheck() {
+  console.log("Graph ingestion diagnostic (read-only) — is it already set up?\n");
+  console.log(`  tenant : ${TENANT}`);
+  console.log(`  client : ${CLIENT}`);
+  console.log(`  mailbox: ${MAILBOX}\n`);
+  try {
+    TOKEN = await token();
+    console.log("  [1/2] OAuth token .......... OK  (app registration exists, secret valid)");
+  } catch (e) {
+    console.log(`  [1/2] OAuth token .......... FAILED — ${e.message}`);
+    console.log("        → wrong tenant/client id or secret, or the app registration doesn't exist yet.");
+    return;
+  }
+  const r = await gget(`${mbPath()}/mailFolders/Inbox?$select=displayName,totalItemCount`);
+  if (r.ok) {
+    console.log(`  [2/2] Read ${MAILBOX} Inbox .. OK  ("${r.json.displayName}", ${r.json.totalItemCount} items)`);
+    console.log("\n  ✅ Already set up — Mail.Read works for this mailbox. You can run --list / --pull.");
+  } else {
+    console.log(`  [2/2] Read ${MAILBOX} Inbox .. HTTP ${r.status}`);
+    if (r.status === 403) console.log("        → app authenticates but is NOT permitted. Add Mail.Read (Application) + admin consent,\n          and ensure the Application Access Policy grants THIS app access to THIS mailbox.");
+    else if (r.status === 404) console.log("        → mailbox not found. Check GRAPH_MAILBOX is the exact shared-mailbox address.");
+    else console.log("        → " + (r.text || "").slice(0, 300));
+    console.log("\n  ⚠ Not fully set up yet (see above).");
+  }
+}
+
 // Minimal HTML → text for email bodies (strip tags/entities). Extraction proper is Step 2.
 function htmlToText(html) {
   return String(html || "")
@@ -140,9 +167,10 @@ async function main() {
   const args = process.argv.slice(2);
   const limit = args.indexOf("--limit") !== -1 ? parseInt(args[args.indexOf("--limit") + 1], 10) : 25;
   const outDir = args.indexOf("--out") !== -1 ? args[args.indexOf("--out") + 1] : null;
+  if (args.includes("--check")) return cmdCheck();
   if (args.includes("--list")) return cmdList(limit);
   if (args.includes("--pull")) return cmdPull(limit, outDir);
-  console.log("Usage:\n  mailbox.js --list [--limit N]           (read-only preview)\n  mailbox.js --pull [--limit N] [--out <dir>]  (emit new messages, update local state)");
+  console.log("Usage:\n  mailbox.js --check                      (diagnose whether Graph access is set up)\n  mailbox.js --list [--limit N]           (read-only preview)\n  mailbox.js --pull [--limit N] [--out <dir>]  (emit new messages, update local state)");
 }
 
 main().catch((e) => { console.error(e.message || e); process.exit(1); });
