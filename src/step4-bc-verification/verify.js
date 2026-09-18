@@ -149,9 +149,19 @@ async function checkCustomer(company, order, custCache) {
 }
 
 // Fetch one item record by our item number (for inventory/UoM after resolution).
-// Part numbers are spaced inconsistently in BC ("HW 4432", ".112 1010") and
-// customers reformat them on POs ("HW4432", "SN1409"). Match whitespace-insensitively.
-const normPart = (s) => (s || "").toUpperCase().replace(/\s+/g, "");
+// Part numbers are formatted inconsistently: BC has "HW 4432" / "2004-1", customers
+// reformat on POs ("HW4432", "2004 1"). Match ignoring case, whitespace, hyphens and
+// slashes (verified against the item master: 0 slashes except one item, 6,339 hyphens,
+// and ignoring -,/ introduces only 6 same-part collisions, which we flag not guess).
+const normPart = (s) => (s || "").toUpperCase().replace(/[\s\/-]+/g, "");
+
+// Customers often cite OUR part number in the line description as a vendor part
+// number, e.g. "(V.PN# WPM 08002)" or "V.PN# HS3 5811". When the part fields don't
+// resolve, mine this as a fallback candidate for a direct (our-item) match.
+function vendorPartFromDesc(desc) {
+  const m = String(desc || "").match(/v\.?\s*p\.?\s*n\.?\s*#?\s*:?\s*([A-Za-z0-9][A-Za-z0-9 .\/-]*?)\s*(?:\)|\]|—|,|;|$)/i);
+  return m ? m[1].trim() : null;
+}
 
 // Item index: our whole item master, keyed by normalized number. Loaded once,
 // cached for the process (so a --batch run pulls items just once).
@@ -208,10 +218,11 @@ async function checkLine(company, line, custNo) {
   const qty = line.quantity;
   const label = supplier || customer || line.description || `line ${line.line_no ?? "?"}`;
 
-  // Rule 2, path (a) DIRECT — supplier PN, then customer PN, as our items.number
-  // (whitespace-insensitive: "HW4432" matches "HW 4432").
+  // Rule 2, path (a) DIRECT — try supplier PN, then customer PN, then a vendor P/N
+  // mined from the description, each as our items.number (whitespace/-/-insensitive).
+  const vpn = vendorPartFromDesc(line.description);
   let item = null, via = null;
-  for (const [pn, tag] of [[supplier, "supplier_part"], [customer, "customer_part"]]) {
+  for (const [pn, tag] of [[supplier, "supplier_part"], [customer, "customer_part"], [vpn, "vendor P/N in description"]]) {
     if (!pn) continue;
     const r = await resolveItem(company, pn);
     if (r.ambiguous) return { label, pass: false, rule2: false, detail: `part "${pn}" matches ${r.ambiguous.length} items (${r.ambiguous.slice(0, 4).join(", ")}) — ambiguous` };
