@@ -150,10 +150,12 @@ async function checkCustomer(company, order, custCache) {
 
 // Fetch one item record by our item number (for inventory/UoM after resolution).
 // Part numbers are formatted inconsistently: BC has "HW 4432" / "2004-1", customers
-// reformat on POs ("HW4432", "2004 1"). Match ignoring case, whitespace, hyphens and
-// slashes (verified against the item master: 0 slashes except one item, 6,339 hyphens,
-// and ignoring -,/ introduces only 6 same-part collisions, which we flag not guess).
-const normPart = (s) => (s || "").toUpperCase().replace(/[\s\/-]+/g, "");
+// reformat on POs ("HW4432", "2004 1"). Normalize case, whitespace and hyphens.
+// Slash is KEPT (one real item — BF CI1/42 — contains one), but matched BOTH ways:
+// a part is looked up with the slash and with it removed, so "/2004" and "2004" both hit.
+const stripSD = (s) => (s || "").toUpperCase().replace(/[\s-]+/g, ""); // upper, no space/hyphen; slash kept
+const noSlash = (k) => k.replace(/\//g, "");
+const normPart = (s) => noSlash(stripSD(s)); // fully normalized (slash-insensitive) — used by cross-ref
 
 // Customers often cite OUR part number in the line description as a vendor part
 // number, e.g. "(V.PN# WPM 08002)" or "V.PN# HS3 5811". When the part fields don't
@@ -163,27 +165,32 @@ function vendorPartFromDesc(desc) {
   return m ? m[1].trim() : null;
 }
 
-// Item index: our whole item master, keyed by normalized number. Loaded once,
-// cached for the process (so a --batch run pulls items just once).
+// Item index: our whole item master, keyed by BOTH the slash-kept and slash-removed
+// normalized forms, so a part matches whether or not the slash is present, while the
+// slash stays real for the item that has one. Loaded once, cached for the process.
 let ITEM_INDEX = null;
 async function buildItemIndex(company) {
   if (ITEM_INDEX) return ITEM_INDEX;
   const res = await getAll(`companies(${company.id})/items?$select=number,displayName,inventory,blocked,baseUnitOfMeasureCode`);
   if (!res.ok) throw new Error(`items read -> HTTP ${res.status}`);
   const idx = new Map();
+  const add = (k, it) => { if (k) (idx.get(k) || idx.set(k, []).get(k)).push(it); };
   for (const it of res.rows) {
-    const k = normPart(it.number);
-    if (!k) continue;
-    (idx.get(k) || idx.set(k, []).get(k)).push(it);
+    const k = stripSD(it.number);   // slash kept, e.g. "BFCI1/42"
+    add(k, it);
+    const k2 = noSlash(k);          // slash removed, e.g. "BFCI142"
+    if (k2 !== k) add(k2, it);
   }
   ITEM_INDEX = idx;
   return idx;
 }
-// Resolve a part string to a single item by normalized number.
-// -> { item } | { ambiguous:[numbers] } | { item:null }
+// Resolve a part string to a single item, trying both the slash-kept and
+// slash-removed forms. -> { item } | { ambiguous:[numbers] } | { item:null }
 async function resolveItem(company, pn) {
-  const hits = (await buildItemIndex(company)).get(normPart(pn));
-  if (!hits || !hits.length) return { item: null };
+  const idx = await buildItemIndex(company);
+  const k = stripSD(pn), k2 = noSlash(k);
+  const hits = [...(idx.get(k) || []), ...(k2 !== k ? (idx.get(k2) || []) : [])];
+  if (!hits.length) return { item: null };
   const distinct = [...new Map(hits.map((h) => [h.number, h])).values()];
   return distinct.length > 1 ? { ambiguous: distinct.map((d) => d.number) } : { item: distinct[0] };
 }
