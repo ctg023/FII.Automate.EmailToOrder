@@ -37,11 +37,14 @@ BC-side items (some now confirmed from the live probe on 2026-09-17):
   Confirmed on real orders (e.g. S44 3/4 lines, S08 → APPROVE-READY). APPROVE-READY 8/29 and rising as
   Rule 1 / UoM are tuned. Remaining line gaps: unresolved customers, genuine stock-outs, and EA↔PCS UoM
   skips (a UoM synonym map is a Later item).
-- ✅ **Rule 1 (customer match) validated on real data: 18/29 (62%)** resolved cleanly via `verify.js --batch`.
-  The remaining 11: 3 extraction gaps (S12/S13/S35, no name), 1 genuinely new customer (Big Bolt), 5
-  ambiguous ties that the matcher safely FLAGS instead of guessing, 1 abbreviation miss (Manufacturing↔Mfg),
-  1 borderline. **Matcher tuning identified:** abbreviation normalization + secondary-signal (address/email)
-  tie-breaker. No logic bug.
+- ✅ **Rule 1 (customer match) tuned — 18/29 (62%) at higher precision.** Matcher is now token-based
+  (whole words, not substrings): a candidate must contain ALL order name tokens, with abbreviation expansion
+  (Mfg↔Manufacturing), plural stemming, country-word stripping, and a ship-to city/state tie-breaker.
+  All knobs live in one `MATCH` config block in verify.js (rules expected to change → single edit point).
+  Prefers to FLAG over mis-resolve: eliminated prior false positives (e.g. "Westwood…"→"ICA Corp") and
+  giant tie-sets. Remaining flags are mostly correct (multi-location duplicates, not-in-BC, extraction gaps).
+  Known limits: one subset false-positive (Big Bolt→Big D Bolt & Tool), and initials-only names (T/J) flag.
+  Next tuning candidates: UoM synonym map (EA↔PCS), initials handling.
 - ⚠️ **BC OData `$top` gotcha (bit us):** a small `$top` hard-caps the total AND suppresses `@odata.nextLink`,
   silently hiding the rest of a table. Always page via `nextLink` with no `$top`. (An earlier "only 1,000
   customers / looks like sandbox" reading was this bug, now fixed in verify.js + data-quality.js.)

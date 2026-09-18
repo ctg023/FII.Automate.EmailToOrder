@@ -49,18 +49,52 @@ async function getAll(firstPath) {
 }
 const odataStr = (s) => `'${String(s).replace(/'/g, "''")}'`; // escape single quotes
 
-// --- matching helpers (v1, heuristic) ---------------------------------------
-const SUFFIXES = /\b(inc|incorporated|llc|l\.l\.c|co|corp|corporation|company|ltd|limited|lp|llp)\b/gi;
-function normName(s) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/[.,&]/g, " ")
-    .replace(SUFFIXES, " ")
-    .replace(/[^a-z0-9 ]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+// --- customer-matching config (ONE place to tune; rules are expected to change) ---
+// Everything the Rule-1 matcher does is driven by this object. To change matching
+// behavior, edit here — no need to touch the scoring logic below.
+const MATCH = {
+  // Match policy: a candidate qualifies only if it contains ALL of the order's
+  // name tokens (whole words, after suffix-strip / abbrev-expand / plural-stem).
+  // Matching on a single shared common word ("iron", "engineering") is unsafe in a
+  // human-in-the-loop flow, so we prefer to FLAG rather than guess.
+  minOrderTokens: 2,   // orders whose name reduces to <2 tokens are too generic to
+                       //   auto-resolve (e.g. "Mac B" -> just "mac") -> flag for a rep
+  minTokenLen: 2,      // drop 1-char tokens
+  geoTieBreak: true,   // when several candidates qualify, prefer the one whose
+                       //   city/state matches the order's ship-to (BC email is a
+                       //   shared placeholder, so it can't break ties here)
+  // Legal/entity words removed before tokenizing.
+  suffixes: new Set(["inc", "incorporated", "llc", "co", "corp", "corporation",
+    "company", "ltd", "limited", "lp", "llp", "the", "usa"]),
+  // Abbreviation -> canonical, applied per token (fixes e.g. "Mfg" vs "Manufacturing").
+  abbrev: {
+    mfg: "manufacturing", intl: "international", assoc: "associates",
+    svc: "services", svcs: "services", prod: "products", prods: "products",
+    ind: "industries", inds: "industries", mach: "machine", fab: "fabrication",
+    prec: "precision", mtl: "metal", prods_: "products",
+  },
+};
+
 const emailDomain = (e) => ((e || "").split("@")[1] || "").toLowerCase().trim();
+
+// Light stem: drop a trailing plural "s" so fastener/fasteners, product/products match.
+const stem = (t) => (t.length > 3 && t.endsWith("s") && !t.endsWith("ss") ? t.slice(0, -1) : t);
+
+function normName(s) {
+  return (s || "").toLowerCase().replace(/[.,&/]/g, " ").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+}
+// Tokenize a company name into comparable whole-word tokens (suffixes dropped,
+// abbreviations expanded, plurals stemmed). Returns a de-duplicated array.
+function tokenize(name) {
+  const out = new Set();
+  for (let t of normName(name).split(" ")) {
+    if (!t || t.length < MATCH.minTokenLen || MATCH.suffixes.has(t)) continue;
+    t = MATCH.abbrev[t] || t;
+    out.add(stem(t));
+  }
+  return [...out];
+}
+const normGeo = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "").trim();
 
 async function resolveCompany() {
   const cr = await get("companies");
@@ -74,27 +108,44 @@ async function resolveCompany() {
 }
 
 // Rule 1 — customer resolves ------------------------------------------------
+// A candidate qualifies iff it contains ALL order name tokens (whole words).
+// Exact normalized-name match takes precedence; ties broken by ship-to geo.
 async function checkCustomer(company, order, custCache) {
-  const want = normName(order?.customer?.name);
-  const domain = emailDomain(order?.customer?.contact_email);
-  if (!want && !domain) {
+  const wantName = normName(order?.customer?.name);
+  const wantTokens = tokenize(order?.customer?.name);
+  if (!wantName) {
     return { rule: "1 customer", pass: false, detail: "no customer name or email in the order to match on" };
   }
-  const customers = custCache.rows;
-  const scored = [];
-  for (const c of customers) {
-    const cn = normName(c.displayName);
-    let score = 0;
-    if (want && cn === want) score += 100;
-    else if (want && cn && (cn.includes(want) || want.includes(cn))) score += 60;
-    if (domain && emailDomain(c.email) === domain) score += 50;
-    if (score > 0) scored.push({ number: c.number, displayName: c.displayName, blocked: c.blocked, score });
+  if (wantTokens.length < MATCH.minOrderTokens) {
+    return { rule: "1 customer", pass: false, detail: `customer name "${order?.customer?.name}" is too generic to match confidently (needs ${MATCH.minOrderTokens}+ significant words)` };
   }
-  scored.sort((a, b) => b.score - a.score);
-  const top = scored.filter((s) => s.score === scored[0]?.score);
-  if (scored.length === 0) return { rule: "1 customer", pass: false, detail: `no BC customer matches "${order?.customer?.name ?? ""}"` };
-  if (top.length > 1) return { rule: "1 customer", pass: false, detail: `ambiguous — ${top.length} customers tie (${top.map((t) => t.number).join(", ")})`, candidates: top };
-  return { rule: "1 customer", pass: true, detail: `resolved to ${top[0].number} (${top[0].displayName})`, match: top[0] };
+
+  const exact = [], subset = [];
+  for (const c of custCache.rows) {
+    const cand = { number: c.number, displayName: c.displayName, city: c.city, state: c.state, blocked: c.blocked };
+    if (normName(c.displayName) === wantName) { exact.push(cand); continue; }
+    const ct = new Set(tokenize(c.displayName));
+    if (wantTokens.every((t) => ct.has(t))) subset.push(cand); // contains all order tokens
+  }
+  let pool = exact.length ? exact : subset;
+  const via = exact.length ? "exact name" : "all-tokens";
+  if (pool.length === 0) {
+    return { rule: "1 customer", pass: false, detail: `no BC customer matches "${order?.customer?.name}"` };
+  }
+
+  // Tie-break on ship-to city/state when several candidates qualify.
+  let brokeBy = null;
+  if (pool.length > 1 && MATCH.geoTieBreak) {
+    const oCity = normGeo(order?.ship_to?.city), oState = normGeo(order?.ship_to?.state);
+    if (oCity) {
+      const geo = pool.filter((t) => normGeo(t.city) === oCity && (!oState || normGeo(t.state) === oState));
+      if (geo.length === 1) { pool = geo; brokeBy = "ship-to city/state"; }
+    }
+  }
+  if (pool.length > 1) {
+    return { rule: "1 customer", pass: false, detail: `ambiguous — ${pool.length} customers tie (${pool.slice(0, 6).map((t) => t.number).join(", ")}${pool.length > 6 ? ", …" : ""})`, candidates: pool };
+  }
+  return { rule: "1 customer", pass: true, detail: `resolved to ${pool[0].number} (${pool[0].displayName}) [via ${via}${brokeBy ? ` + ${brokeBy}` : ""}]`, match: pool[0] };
 }
 
 // Fetch one item record by our item number (for inventory/UoM after resolution).
@@ -173,7 +224,7 @@ export async function verifyOrder(order) {
   const company = await resolveCompany();
   // No $top — in BC OData, $top hard-caps the total AND suppresses @odata.nextLink,
   // so a small $top silently hides the rest of the table. Let nextLink page it all.
-  const custCache = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,blocked`);
+  const custCache = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,city,state,blocked`);
   if (!custCache.ok) throw new Error(`customers read -> HTTP ${custCache.status}`);
 
   const r1 = await checkCustomer(company, order, custCache);
