@@ -276,12 +276,15 @@ async function selftest() {
 const unwrap = (j) => (j && j.extraction ? j.extraction : j);
 
 // --- batch: run every order-classified file in a dir, focus on Rule 1 -------
-async function batch(dir) {
+async function batch(dir, jsonOut) {
   const files = readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
   let orders = 0, r1pass = 0, overallReady = 0;
-  console.log(`Batch over ${dir} — Rule 1 (customer match) focus:\n`);
-  console.log("  sample  R1    lines        overall            customer / detail");
-  console.log("  ------  ----  -----------  -----------------  -----------------");
+  const records = [];
+  if (!jsonOut) {
+    console.log(`Batch over ${dir} — Rule 1 (customer match) focus:\n`);
+    console.log("  sample  R1    lines        overall            customer / detail");
+    console.log("  ------  ----  -----------  -----------------  -----------------");
+  }
   for (const f of files) {
     const raw = JSON.parse(readFileSync(join(dir, f), "utf8"));
     if (raw.classification && raw.classification !== "order") continue; // only orders have a customer to match
@@ -289,15 +292,33 @@ async function batch(dir) {
     orders++;
     let res;
     try { res = await verifyOrder(order); }
-    catch (e) { console.log(`  ${(raw.sample_id || f).padEnd(6)}  ERR   —            —                  ${e.message}`); continue; }
+    catch (e) {
+      if (!jsonOut) console.log(`  ${(raw.sample_id || f).padEnd(6)}  ERR   —            —                  ${e.message}`);
+      continue;
+    }
     if (res.rule1.pass) r1pass++;
     if (res.approveReady) overallReady++;
     const nOk = res.lines.filter((l) => l.pass).length;
     const id = (raw.sample_id || f).replace(/\.json$/, "");
-    console.log(
+    // Structured record (order fields + verification) for the review UI / future app.
+    records.push({
+      id, po_number: order.po_number, order_date: order.order_date,
+      requested_ship_date: order.requested_ship_date,
+      customer: order.customer, ship_to: order.ship_to,
+      line_items: order.line_items, company: res.company,
+      rule1: res.rule1, lines: res.lines, linesPass: res.linesPass,
+      approveReady: res.approveReady,
+    });
+    if (!jsonOut) console.log(
       `  ${id.padEnd(6)}  ${(res.rule1.pass ? "PASS" : "FLAG")}  ${`${nOk}/${res.lines.length} ok`.padEnd(11)}  ` +
       `${(res.approveReady ? "APPROVE-READY" : "flagged").padEnd(17)}  ${res.rule1.detail}`
     );
+  }
+  if (jsonOut) {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(jsonOut, JSON.stringify({ generated: new Date().toISOString(), orders, r1pass, overallReady, records }, null, 2));
+    console.log(`Wrote ${records.length} verified orders -> ${jsonOut}`);
+    return;
   }
   console.log(`\n  Orders tested: ${orders}`);
   console.log(`  Rule 1 (customer) resolved: ${r1pass}/${orders}  (${orders ? ((r1pass / orders) * 100).toFixed(0) : 0}%)`);
@@ -313,7 +334,9 @@ async function main() {
   const orderFlag = args.indexOf("--order");
   const batchFlag = args.indexOf("--batch");
   if (args.includes("--selftest")) return selftest();
-  if (batchFlag !== -1 && args[batchFlag + 1]) return batch(args[batchFlag + 1]);
+  const jsonFlag = args.indexOf("--json");
+  const jsonOut = jsonFlag !== -1 ? args[jsonFlag + 1] : null;
+  if (batchFlag !== -1 && args[batchFlag + 1]) return batch(args[batchFlag + 1], jsonOut);
   if (orderFlag !== -1 && args[orderFlag + 1]) {
     const order = unwrap(JSON.parse(readFileSync(args[orderFlag + 1], "utf8")));
     return printReport(order, await verifyOrder(order));

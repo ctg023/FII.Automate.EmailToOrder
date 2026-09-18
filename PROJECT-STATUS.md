@@ -23,7 +23,10 @@ user + password over HTTPS; ⚠️ Web Service Access Keys are deprecated — ea
 SaaS migration ~Feb 2027 swaps this one layer to OAuth 2.0 S2S) · off-network access via GlobalProtect ·
 no public BC exposure · Graph API for mailbox ingestion · decoupled stages · **shared review queue —
 orders are NOT routed per salesperson** (so customer `salespersonCode` coverage is a non-issue) ·
-**no auto-create: clean orders are staged approve-ready, a human always clicks Approve through rollout.**
+**no auto-create: clean orders are staged approve-ready, a human always clicks Approve through rollout** ·
+**mailbox is READ-ONLY — never mark-read / move / delete / flag the production `orders@` mailbox** (Graph
+`Mail.Read.Shared` only). Consequence: the pipeline must track already-processed emails in its OWN state
+store (keyed by Graph message-id), since we can't move or flag them to mark "done".
 
 ## Recommended (not yet confirmed — decide at review-app stage)
 - **Web app hosting:** IIS reverse proxy → standalone Node Windows service (not `iisnode`). Fallback: Node serves HTTPS directly.
