@@ -10,14 +10,22 @@ created in BC. Goal: cut manual order entry for ~10 reps while keeping a human i
 
 **A human approves every order before it is created in BC. No auto-create — ever, at least through rollout.**
 
-## Status (2026-09-17)
+## Status (2026-09-18)
+See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed status — keep that current too.
 - **Step 1 (sample set):** done — 50 labeled sample emails in `samples/` (29 order, 8 ambiguous, 13 not_order).
 - **Step 2 (extraction):** done — harness in `src/step2-extraction/`; ~100% on order content.
 - **Step 3 (classification):** done — harness in `src/step3-classification/`; 92%, **0 dropped orders**.
-- **Step 4 (BC verification):** connectivity **proven** (read-only) via `src/step4-bc-verification/ping.js`.
-  Next: answer the two data-quality questions (item cross-reference population, salesperson-code coverage),
-  catalog the verification rules, then build the read-only checks.
-- Later: review-queue web app (Teams tab), order creation vs a BC sandbox, pilot with 1–2 reps.
+- **Step 4 (BC verification):** done (read-only v1) — `src/step4-bc-verification/verify.js` resolves customer
+  (Rule 1) + line items via direct/cross-ref (Rule 2) + stock (Rule 3), and assigns a **disposition**
+  (Order / Quote / Needs-review). `--batch <dir> --json <out>` emits structured per-order records.
+- **Step 5 (review UI):** prototype — `src/step5-review/render.js` turns the Step-4 `--json` output into the
+  static review page (queue grouped by disposition, per-line checks, customer "did you mean" pick-list).
+  Buttons are a **mock**; the page embeds PII so it renders to git-ignored `out/`. Not yet a live web app.
+- **Step 6 (order creation):** write **proven** vs a BC dev/test company — `src/step6-order-creation/create.js`
+  created a Sales Order and a Quote (dry-run by default; double-guarded `--create`+`--company`). Still gated
+  behind human approval; sandbox-first.
+- **Ingestion (Track A):** read-only mailbox pull built — `src/ingestion/mailbox.js` (needs Entra app + `.env`).
+- Later: turn the Step-5 prototype into the real review web app (Teams tab); pilot with 1–2 reps.
 
 ## Stack & architecture
 - **Node.js (ESM)** throughout. No build step; run `.js` directly with `node`.
@@ -29,27 +37,39 @@ created in BC. Goal: cut manual order entry for ~10 reps while keeping a human i
 
 ## Repo layout
 ```
+src/ingestion/            # mailbox.js = read-only Graph pull from orders@ (Track A)
 src/step2-extraction/     # extraction harness (schema.js, extract.js, score.js, run.js)
 src/step3-classification/ # order/not_order/unsure classifier (same shape)
-src/step4-bc-verification/# ping.js = read-only BC connectivity/permissions probe
+src/step4-bc-verification/# ping.js (connectivity), data-quality.js, verify.js (read-only rules + disposition)
+src/step5-review/         # render.js = Step-4 --json output -> static review page (prototype; mock buttons)
+src/step6-order-creation/ # create.js = BC Sales Order / Quote write (dry-run default, double-guarded)
 samples/                  # test set. README + extraction-schema.json are committed;
                           #   raw/, answer-keys/, manifest.csv, FINDINGS.md are git-ignored (customer data)
+out/                      # git-ignored render/verify output (contains PII) — e.g. verified.json, review.html
 .env                      # secrets (git-ignored). Copy from .env.example
 PROJECT-STATUS.md         # living status + open items
 ```
 
 ## Running the harnesses
-On this network, prefix Node with `NODE_OPTIONS=--use-system-ca` (see gotchas).
-```bash
+This machine's shell is **PowerShell**. On this network set the corporate-CA option once per
+session with `$env:NODE_OPTIONS="--use-system-ca"` (see gotchas), then run node normally.
+```powershell
 npm install
-node src/step2-extraction/run.js --list          # what's testable (free)
-node src/step2-extraction/run.js --estimate --all # token/cost estimate only (free)
-node src/step2-extraction/run.js --sample S03     # run ONE (safe default)
-node src/step2-extraction/run.js --all            # run all, then --rescore is free
-node src/step3-classification/run.js --all        # classifier
-node src/step4-bc-verification/ping.js            # BC read-only smoke test (needs BC_* in .env)
+$env:NODE_OPTIONS = "--use-system-ca"                 # once per terminal (corporate TLS)
+node src/step2-extraction/run.js --list               # what's testable (free)
+node src/step2-extraction/run.js --estimate --all     # token/cost estimate only (free)
+node src/step2-extraction/run.js --sample S03         # run ONE (safe default)
+node src/step2-extraction/run.js --all                # run all, then --rescore is free
+node src/step3-classification/run.js --all            # classifier
+node src/step4-bc-verification/ping.js                # BC read-only smoke test (needs BC_* in .env)
+# Review pipeline (read-only): verify the sample orders, then render the review UI.
+node src/step4-bc-verification/verify.js --batch samples/answer-keys --json out/verified.json
+node src/step5-review/render.js --in out/verified.json --out out/review.html
+start out/review.html                                 # open the review page
 ```
+(Bash/CI equivalent for the env var: prefix a command with `NODE_OPTIONS=--use-system-ca node ...`.)
 Guardrail: harnesses run nothing without an explicit `--sample`/`--all`/`--estimate` flag.
+Reminder: `create.js --create` (Step 6) is the only thing that WRITES to BC; the review pipeline never does.
 
 ## Conventions
 - **Claude API:** `@anthropic-ai/sdk`, `client.messages.parse()` with **Zod v4** structured output

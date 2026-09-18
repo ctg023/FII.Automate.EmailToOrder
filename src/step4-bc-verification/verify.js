@@ -408,7 +408,9 @@ async function batch(dir, jsonOut) {
     if (!jsonOut) console.log(`  ${id.padEnd(6)}  ${label.padEnd(16)}  ${res.dispositionReason}`);
   }
   if (jsonOut) {
-    const { writeFileSync } = await import("node:fs");
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    mkdirSync(dirname(jsonOut), { recursive: true }); // ensure out/ exists
     writeFileSync(jsonOut, JSON.stringify({ generated: new Date().toISOString(), orders, tally, records }, null, 2));
     console.log(`Wrote ${records.length} verified orders -> ${jsonOut}`);
     return;
