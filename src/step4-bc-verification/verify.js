@@ -438,4 +438,11 @@ async function main() {
   console.log("Usage:\n  verify.js --order <extracted-order.json>\n  verify.js --batch <dir>   (all order-classified *.json in a dir)\n  verify.js --selftest      (builds pass/flag orders from live BC)");
 }
 
-main().catch((e) => { console.error(e.message || e); process.exit(1); });
+// Only run the CLI when executed directly — importing this module (e.g. from the
+// Step-6 create tool) should not trigger main().
+import { pathToFileURL } from "node:url";
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => { console.error(e.message || e); process.exit(1); });
+}
+
+export { normPart, resolveItem, buildItemIndex };
