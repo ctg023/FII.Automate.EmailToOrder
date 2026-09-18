@@ -57,9 +57,10 @@ const MATCH = {
   // name tokens (whole words, after suffix-strip / abbrev-expand / plural-stem).
   // Matching on a single shared common word ("iron", "engineering") is unsafe in a
   // human-in-the-loop flow, so we prefer to FLAG rather than guess.
-  minOrderTokens: 2,   // orders whose name reduces to <2 tokens are too generic to
-                       //   auto-resolve (e.g. "Mac B" -> just "mac") -> flag for a rep
-  minTokenLen: 2,      // drop 1-char tokens
+  minOrderTokens: 1,   // uniqueness is the confidence signal: if the name's tokens
+                       //   match exactly ONE customer we resolve it, even for short
+                       //   names ("Mac B", "T/J") — >1 match still flags for a rep.
+  minTokenLen: 1,      // keep 1-char tokens — initials like "B"/"T"/"J" are meaningful
   geoTieBreak: true,   // when several candidates qualify, prefer the one whose
                        //   city/state matches the order's ship-to (BC email is a
                        //   shared placeholder, so it can't break ties here)
