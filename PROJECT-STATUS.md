@@ -37,6 +37,13 @@ human-approved, sandbox-first write.
 - **Web app hosting:** IIS reverse proxy → standalone Node Windows service (not `iisnode`). Fallback: Node serves HTTPS directly.
 
 ## Open items / needed from Corey
+Track A (live mailbox ingestion) — **code built** (`src/ingestion/mailbox.js`, read-only), needs M365 setup:
+- ⛔ **Entra app registration** for Graph, then `.env` (GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET/MAILBOX).
+  Setup spec in `src/ingestion/README.md`.
+- ⚠️ **Auth-model decision:** built as **app-only `Mail.Read` (application permission)** + Application Access
+  Policy scoping to `orders@` — the right model for an unattended VM service. This differs from the earlier
+  CLAUDE.md note of delegated `Mail.Read.Shared` (which needs an interactive user). Confirm app-only is OK.
+
 BC-side items (some now confirmed from the live probe on 2026-09-17):
 - ✅ BC connectivity confirmed — NavUserPassword auth works; OData API v2.0 published; read access on
   customers/items/salesOrders. `Fasteners` is the real production company (**9,379 customers**, 10,042 items).
