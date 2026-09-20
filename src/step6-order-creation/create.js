@@ -70,7 +70,8 @@ function buildDoc(order, res) {
   // Sales orders use `orderDate`; sales quotes use `documentDate`.
   const dateField = res.disposition === "order" ? "orderDate" : "documentDate";
   if (isISO(order.order_date)) header[dateField] = order.order_date.slice(0, 10);
-  if (isISO(order.requested_ship_date)) header.requestedDeliveryDate = order.requested_ship_date.slice(0, 10);
+  // requestedDeliveryDate exists on salesOrder only — salesQuote 400s on it.
+  if (res.disposition === "order" && isISO(order.requested_ship_date)) header.requestedDeliveryDate = order.requested_ship_date.slice(0, 10);
   const lines = res.lines
     .map((l, i) => ({ lineType: "Item", lineObjectNumber: l.item, quantity: order.line_items?.[i]?.quantity }))
     .filter((l) => l.lineObjectNumber && l.quantity != null);
