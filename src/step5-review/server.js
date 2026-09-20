@@ -18,6 +18,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve, normalize, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { createDoc } from "../step6-order-creation/create.js";
+import { verifyOrder } from "../step4-bc-verification/verify.js";
 import { page } from "./render.js";
 
 const PORT = Number(process.env.REVIEW_PORT || 8787);
@@ -80,11 +81,29 @@ async function handle(req, res) {
   }
   if (req.method === "GET" && p.startsWith("/pdfs/")) return servePdf(req, res, p);
 
+  // Assign a customer a rep picked from the "did you mean" list, then re-verify.
+  if (req.method === "POST" && p === "/api/assign") {
+    const { conversationId, customerNumber, customerName } = await readBody(req);
+    const store = loadStore();
+    const entry = store.threads[conversationId];
+    if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
+    try {
+      const res2 = await verifyOrder(orderFromRecord(entry.record), { forceCustomer: { number: customerNumber, displayName: customerName } });
+      const r = entry.record;
+      r.rule1 = res2.rule1; r.lines = res2.lines; r.linesPass = res2.linesPass;
+      r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
+      r.customer_assigned = { number: customerNumber, name: customerName };
+      saveStore(store);
+      return json(res, 200, { ok: true, disposition: res2.disposition, dispositionReason: res2.dispositionReason });
+    } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
+
   if (req.method === "POST" && p === "/api/preview") {
     const { conversationId } = await readBody(req);
     const entry = loadStore().threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
-    try { return json(res, 200, await createDoc(orderFromRecord(entry.record), { doCreate: false })); }
+    const fc = entry.record.customer_assigned ? { number: entry.record.customer_assigned.number, displayName: entry.record.customer_assigned.name } : null;
+    try { return json(res, 200, await createDoc(orderFromRecord(entry.record), { doCreate: false, forceCustomer: fc })); }
     catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
   }
 
@@ -93,8 +112,9 @@ async function handle(req, res) {
     const store = loadStore();
     const entry = store.threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
+    const fc = entry.record.customer_assigned ? { number: entry.record.customer_assigned.number, displayName: entry.record.customer_assigned.name } : null;
     try {
-      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate });
+      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate, forceCustomer: fc });
       if (out.ok && out.created) { // mark actioned so it leaves the open queue
         entry.record.status = "actioned"; entry.record.bc_number = out.number; entry.record.bc_docType = out.docType;
         entry.record.bc_url = bcLink(out.docType, out.number);

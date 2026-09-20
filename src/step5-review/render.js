@@ -40,7 +40,7 @@ function suggestionBtn(s) {
   if (s.city) bits.push(esc([s.city, s.state].filter(Boolean).join(", ")));
   if (s.of) bits.push(`matches ${s.shared}/${s.of} words`);
   if (s.geo) bits.push("same city ✓");
-  return `<button class="sugg"><b>${esc(s.displayName)}</b><span class="sm">${bits.join(" · ")}</span></button>`;
+  return `<button class="sugg" data-act="assign" data-cust="${esc(s.number)}" data-name="${esc(s.displayName)}"><b>${esc(s.displayName)}</b><span class="sm">${bits.join(" · ")}</span></button>`;
 }
 
 // One line-item check row (dot state from pass / rule2).
@@ -112,7 +112,7 @@ export function card(r) {
 
   const suggestions = r.rule1?.suggestions?.length
     ? `<div class="sec">Did you mean… (pick to assign the customer)</div>
-    <div class="suggs">${r.rule1.suggestions.map(suggestionBtn).join("")}<button class="sugg new">＋ This is a new customer</button></div>`
+    <div class="suggs">${r.rule1.suggestions.map(suggestionBtn).join("")}<button class="sugg new" data-act="new-customer">＋ This is a new customer</button></div>`
     : "";
 
   const lineRows = lineCount
@@ -248,6 +248,22 @@ document.addEventListener('click', async (e)=>{
   const approve = e.target.closest('[data-act="approve"]');
   const confirmBtn = e.target.closest('[data-act="confirm-create"]');
   const cancelBtn = e.target.closest('[data-act="cancel-create"]');
+  const assign = e.target.closest('[data-act="assign"]');
+  const newCust = e.target.closest('[data-act="new-customer"]');
+
+  if(assign){
+    const card = assign.closest('details[data-cid]'); const res = card.querySelector('.result');
+    res.hidden=false; res.textContent='Assigning '+assign.dataset.name+' and re-checking against BC…';
+    const out = await post('/api/assign',{conversationId:card.dataset.cid, customerNumber:assign.dataset.cust, customerName:assign.dataset.name});
+    if(out.ok){ res.textContent='Assigned to '+assign.dataset.name+' → '+out.disposition+'. Reloading…'; setTimeout(()=>location.reload(),700); }
+    else res.textContent='Assign failed: '+(out.reason||'unknown');
+    return;
+  }
+  if(newCust){
+    const res = newCust.closest('details[data-cid]').querySelector('.result');
+    res.hidden=false; res.textContent='Marked NEW customer — create the customer in BC first, then re-check here. (Not auto-created.)';
+    return;
+  }
 
   if(approve){
     const card = approve.closest('details[data-cid]'); const res = card.querySelector('.result');

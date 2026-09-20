@@ -321,14 +321,23 @@ async function checkLine(company, line, custNo) {
   };
 }
 
-export async function verifyOrder(order) {
+export async function verifyOrder(order, opts = {}) {
   const company = await resolveCompany();
-  // No $top — in BC OData, $top hard-caps the total AND suppresses @odata.nextLink,
-  // so a small $top silently hides the rest of the table. Let nextLink page it all.
-  const custCache = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,city,state,blocked`);
-  if (!custCache.ok) throw new Error(`customers read -> HTTP ${custCache.status}`);
-
-  const r1 = await checkCustomer(company, order, custCache);
+  let r1;
+  if (opts.forceCustomer?.number) {
+    // A rep manually assigned this customer in the review app — trust it, skip name-match.
+    r1 = {
+      rule: "1 customer", pass: true,
+      match: { number: opts.forceCustomer.number, displayName: opts.forceCustomer.displayName || opts.forceCustomer.number },
+      detail: `manually assigned to ${opts.forceCustomer.number}${opts.forceCustomer.displayName ? ` (${opts.forceCustomer.displayName})` : ""}`,
+    };
+  } else {
+    // No $top — in BC OData, $top hard-caps the total AND suppresses @odata.nextLink,
+    // so a small $top silently hides the rest of the table. Let nextLink page it all.
+    const custCache = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,city,state,blocked`);
+    if (!custCache.ok) throw new Error(`customers read -> HTTP ${custCache.status}`);
+    r1 = await checkCustomer(company, order, custCache);
+  }
   const custNo = r1.match?.number || null; // resolved customer #, sharpens cross-ref
   const lines = [];
   for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo));

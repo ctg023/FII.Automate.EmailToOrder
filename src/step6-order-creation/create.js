@@ -94,8 +94,8 @@ export async function docExists(company, docType, number) {
   return r.ok && (r.json?.value?.length > 0);
 }
 
-export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false } = {}) {
-  const res = await verifyOrder(order);
+export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false, forceCustomer = null } = {}) {
+  const res = await verifyOrder(order, forceCustomer ? { forceCustomer } : {});
   if (res.disposition === "review") {
     return { ok: false, stage: "verify", disposition: res.disposition, dispositionReason: res.dispositionReason };
   }
