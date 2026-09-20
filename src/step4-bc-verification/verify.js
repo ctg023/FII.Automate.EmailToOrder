@@ -81,8 +81,23 @@ const emailDomain = (e) => ((e || "").split("@")[1] || "").toLowerCase().trim();
 // Light stem: drop a trailing plural "s" so fastener/fasteners, product/products match.
 const stem = (t) => (t.length > 3 && t.endsWith("s") && !t.endsWith("ss") ? t.slice(0, -1) : t);
 
+// Strip company legal-entity designators that otherwise become junk match tokens.
+// Handles foreign forms (esp. Mexican "S.A. de C.V.", "S. de R.L. de C.V.", "S.A.P.I.")
+// as whole phrases — before the dots are split — so we don't leave stray s/r/l/c/v tokens.
+function stripEntitySuffixes(x) {
+  return (x || "")
+    .replace(/\bs\.?\s*a\.?\s*p\.?\s*i\.?(\s+de\s+c\.?\s*v\.?)?/gi, " ") // S.A.P.I. (de C.V.)
+    .replace(/\bs\.?\s*a\.?\s*b\.?(\s+de\s+c\.?\s*v\.?)?/gi, " ")         // S.A.B. (de C.V.)
+    .replace(/\bs\.?\s*de\s*r\.?\s*l\.?(\s+de\s+c\.?\s*v\.?)?/gi, " ")    // S. de R.L. (de C.V.)
+    .replace(/\bs\.?\s*a\.?\s+de\s+c\.?\s*v\.?/gi, " ")                   // S.A. de C.V.
+    .replace(/\bde\s+c\.?\s*v\.?/gi, " ")                                 // de C.V.
+    .replace(/\bs\.?\s*c\.?\b/gi, " ")                                    // S.C.
+    .replace(/\s+/g, " ").trim();
+}
+
 function normName(s) {
-  return (s || "").toLowerCase().replace(/[.,&/]/g, " ").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const x = stripEntitySuffixes((s || "").toLowerCase());
+  return x.replace(/[.,&/]/g, " ").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 }
 // Tokenize a company name into comparable whole-word tokens (suffixes dropped,
 // abbreviations expanded, plurals stemmed). Returns a de-duplicated array.
@@ -321,6 +336,29 @@ async function checkLine(company, line, custNo) {
   };
 }
 
+// Cached full customer list (BC has ~9k; the pull is the slow part). Cached for 10
+// min so verify/preview/approve/search reuse it instead of re-pulling every call.
+let CUST_LIST = null, CUST_LIST_AT = 0;
+async function allCustomers(company) {
+  if (CUST_LIST && Date.now() - CUST_LIST_AT < 10 * 60 * 1000) return CUST_LIST;
+  const res = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,city,state,blocked`);
+  if (!res.ok) throw new Error(`customers read -> HTTP ${res.status}`);
+  CUST_LIST = res.rows; CUST_LIST_AT = Date.now();
+  return CUST_LIST;
+}
+
+// Name-substring search over BC customers, for the review app's "search customer" box.
+export async function searchCustomers(q, limit = 15) {
+  const needle = String(q || "").toLowerCase().trim();
+  if (needle.length < 2) return [];
+  const company = await resolveCompany();
+  const rows = await allCustomers(company);
+  return rows
+    .filter((c) => (c.displayName || "").toLowerCase().includes(needle))
+    .slice(0, limit)
+    .map((c) => ({ number: c.number, displayName: c.displayName, city: c.city, state: c.state }));
+}
+
 export async function verifyOrder(order, opts = {}) {
   const company = await resolveCompany();
   let r1;
@@ -333,10 +371,8 @@ export async function verifyOrder(order, opts = {}) {
     };
   } else {
     // No $top — in BC OData, $top hard-caps the total AND suppresses @odata.nextLink,
-    // so a small $top silently hides the rest of the table. Let nextLink page it all.
-    const custCache = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,city,state,blocked`);
-    if (!custCache.ok) throw new Error(`customers read -> HTTP ${custCache.status}`);
-    r1 = await checkCustomer(company, order, custCache);
+    // so a small $top silently hides the rest of the table. Cached (allCustomers).
+    r1 = await checkCustomer(company, order, { rows: await allCustomers(company) });
   }
   const custNo = r1.match?.number || null; // resolved customer #, sharpens cross-ref
   const lines = [];

@@ -110,9 +110,14 @@ export function card(r) {
   const custMark = r.rule1?.pass ? "✓" : "✕";
   const custKey = r.rule1?.pass ? "Matched" : "Not matched with high certainty";
 
-  const suggestions = r.rule1?.suggestions?.length
-    ? `<div class="sec">Did you mean… (pick to assign the customer)</div>
-    <div class="suggs">${r.rule1.suggestions.map(suggestionBtn).join("")}<button class="sugg new" data-act="new-customer">＋ This is a new customer</button></div>`
+  // Customer fix-up UI, shown whenever the customer didn't resolve: ranked
+  // suggestions (if any) + a live BC customer search + "new customer".
+  const needCustomer = r.rule1 && !r.rule1.pass;
+  const customerFix = needCustomer
+    ? `<div class="sec">Assign customer (pick a suggestion or search)</div>
+    ${r.rule1.suggestions?.length ? `<div class="suggs">${r.rule1.suggestions.map(suggestionBtn).join("")}</div>` : ""}
+    <div class="custsearch"><input class="csi" type="text" placeholder="search BC customers by name…" autocomplete="off"><div class="csresults suggs"></div></div>
+    <button class="sugg new" data-act="new-customer">＋ This is a new customer</button>`
     : "";
 
   const lineRows = lineCount
@@ -140,7 +145,7 @@ export function card(r) {
         <div class="txt"><span class="k">${custKey}</span>
           <div class="sub">${esc(r.rule1?.detail || "")}</div></div>
       </div>
-      ${suggestions}
+      ${customerFix}
       <div class="sec">Line items — part match &amp; stock</div>
       ${lineRows}
       <div class="actions">
@@ -189,6 +194,10 @@ export function page(data, opts = {}) {
   .sugg:hover{border-color:var(--accent)}
   .sugg b{font-size:13.5px}.sugg .sm{color:var(--muted);font-size:12px}
   .sugg.new{color:var(--accent);font-weight:600;flex-direction:row}
+  .custsearch{margin:2px 0 6px}
+  .csi{width:100%;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);font:inherit;font-size:13px}
+  .csi:focus{outline:none;border-color:var(--accent)}
+  .csresults{margin-top:6px}.csresults:empty{margin:0}
   .main{flex:1;min-width:0}.po{font-weight:650}
   .cust{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .meta{color:var(--muted);font-size:12px;text-align:right;white-space:nowrap}
@@ -292,6 +301,23 @@ document.addEventListener('click', async (e)=>{
     } else { res.textContent='Not created: '+(out.reason||'unknown'); }
     return;
   }
+});
+let csTimer;
+document.addEventListener('input', (e)=>{
+  const inp = e.target.closest('.csi'); if(!inp) return;
+  const box = inp.closest('.custsearch').querySelector('.csresults');
+  const q = inp.value.trim();
+  clearTimeout(csTimer);
+  if(q.length < 2){ box.innerHTML=''; return; }
+  csTimer = setTimeout(async ()=>{
+    box.innerHTML = '<div class="sm" style="color:var(--muted);font-size:12px">searching…</div>';
+    try{
+      const j = await (await fetch('/api/search-customers?q='+encodeURIComponent(q))).json();
+      if(!j.ok || !j.results){ box.innerHTML='<div class="sm">search failed</div>'; return; }
+      if(!j.results.length){ box.innerHTML='<div class="sm" style="color:var(--muted);font-size:12px">no matches</div>'; return; }
+      box.innerHTML = j.results.map(c=>'<button class="sugg" data-act="assign" data-cust="'+esc(c.number)+'" data-name="'+esc(c.displayName).replace(/"/g,'&quot;')+'"><b>'+esc(c.displayName)+'</b><span class="sm">#'+esc(c.number)+(c.city?' · '+esc(c.city):'')+(c.state?', '+esc(c.state):'')+'</span></button>').join('');
+    }catch(err){ box.innerHTML='<div class="sm">search error</div>'; }
+  }, 300);
 });
 </script>`;
 

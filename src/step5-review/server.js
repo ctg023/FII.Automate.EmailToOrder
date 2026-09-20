@@ -18,7 +18,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve, normalize, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { createDoc } from "../step6-order-creation/create.js";
-import { verifyOrder } from "../step4-bc-verification/verify.js";
+import { verifyOrder, searchCustomers } from "../step4-bc-verification/verify.js";
 import { page } from "./render.js";
 
 const PORT = Number(process.env.REVIEW_PORT || 8787);
@@ -80,6 +80,11 @@ async function handle(req, res) {
     return res.end(page({ generated: store.generated, records, tally }, { interactive: true }));
   }
   if (req.method === "GET" && p.startsWith("/pdfs/")) return servePdf(req, res, p);
+
+  if (req.method === "GET" && p === "/api/search-customers") {
+    try { return json(res, 200, { ok: true, results: await searchCustomers(url.searchParams.get("q")) }); }
+    catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
 
   // Assign a customer a rep picked from the "did you mean" list, then re-verify.
   if (req.method === "POST" && p === "/api/assign") {
