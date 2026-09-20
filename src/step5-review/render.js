@@ -72,6 +72,20 @@ function conversationBlock(r) {
     <div class="thread">${rows}</div>`;
 }
 
+// Warn when this PO already exists in BC (duplicate guard) so a rep doesn't re-key it.
+function dupBlock(r) {
+  if (!r.duplicates?.length) return "";
+  const items = r.duplicates.map((d) => `${esc(d.ent)} ${esc(d.number)}${d.status ? ` (${esc(d.status)})` : ""}`).join(", ");
+  return `<div class="dupe">⚠ Already in BC for this PO + customer: ${items}. Check before creating.</div>`;
+}
+
+// Links to the saved source PDF(s) so a rep can open the original document.
+function attachBlock(r) {
+  if (!r.attachments_saved?.length) return "";
+  const links = r.attachments_saved.map((a) => `<a class="pdf-link" href="${esc(a.href)}" target="_blank" rel="noopener">📎 ${esc(a.name || "PDF")}</a>`).join(" ");
+  return `<div class="sec">Source document</div><div class="pdfs">${links}</div>`;
+}
+
 // The action row differs by disposition; buttons are a mock (no handlers).
 function actions(disp) {
   if (disp === "order")
@@ -120,6 +134,8 @@ export function card(r) {
     </summary>
     <div class="detail">
       <div class="disporeason">${esc(r.dispositionReason || "")}</div>
+      ${dupBlock(r)}
+      ${attachBlock(r)}
       ${conversationBlock(r)}
       <div class="sec">Customer match</div>
       <div class="check">
@@ -194,6 +210,10 @@ export function page(data) {
   .msg-h{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
   .msg-dir{font-size:11px;color:var(--muted)}.msg-when{margin-left:auto;color:var(--muted);font-size:11px}
   .msg-b{color:var(--muted);margin-top:3px;line-height:1.45}
+  .dupe{background:var(--warn-bg);color:var(--warn);border:1px solid var(--line);border-radius:8px;padding:8px 11px;font-size:12.5px;font-weight:600;margin:4px 0}
+  .pdfs{display:flex;gap:8px;flex-wrap:wrap}
+  .pdf-link{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:8px;padding:5px 10px;font-size:12.5px;text-decoration:none;color:var(--accent);background:var(--panel)}
+  .pdf-link:hover{border-color:var(--accent)}
   code{background:var(--chip);padding:1px 5px;border-radius:5px;font-size:12.5px}</style></head><body><div class="wrap">
 <header><h1>Order Review Queue</h1>
 <p>Prototype · orders read from the <code>orders@</code> mailbox, extracted, and checked against Business Central. ${records.length} order(s) · generated ${esc(when)}.</p></header>

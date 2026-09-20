@@ -33,6 +33,7 @@ import { collectThreads, fetchAttachmentBytes } from "../ingestion/mailbox.js";
 import { makeClient, extractOne, countOne } from "../step2-extraction/extract.js";
 import { classifyOne } from "../step3-classification/classify.js";
 import { verifyOrder } from "../step4-bc-verification/verify.js";
+import { findDuplicates, resolveCompany } from "../step6-order-creation/create.js";
 import { page } from "./render.js";
 
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
@@ -53,6 +54,34 @@ const saveStore = (s) => { mkdirSync(dirname(STORE), { recursive: true }); write
 const sameIds = (a = [], b = []) => a.length === b.length && a.every((x, i) => x === b[i]);
 
 const isPdf = (a) => (a.contentType || "").toLowerCase() === "application/pdf" || /\.pdf$/i.test(a.name || "");
+const PDF_DIR = "out/pdfs";
+let _company = null;
+const getCompany = async () => (_company ||= await resolveCompany());
+
+// Save a thread's PDFs under out/pdfs/<conv>/ so a review card can link the source
+// document. Returns [{name, href}] with href relative to out/ (where the page lives).
+function savePdfs(conversationId, pdfs) {
+  if (!pdfs.length) return [];
+  const dir = `${PDF_DIR}/${conversationId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40)}`;
+  mkdirSync(dir, { recursive: true });
+  const saved = [];
+  for (const p of pdfs) {
+    const fname = (p.name || "attachment.pdf").replace(/[^A-Za-z0-9._-]/g, "_");
+    try { writeFileSync(`${dir}/${fname}`, Buffer.from(p.bytes, "base64")); saved.push({ name: p.name, href: `${dir}/${fname}`.replace(/^out\//, "") }); }
+    catch { /* skip unsavable */ }
+  }
+  return saved;
+}
+
+// For an order/quote record: has this PO already been entered in BC (dup guard),
+// and save its source PDFs. Read-only against BC. Mutates the record in place.
+async function enrichRecord(record, pdfs) {
+  try {
+    const company = await getCompany();
+    record.duplicates = await findDuplicates(company, record.rule1?.match?.number, record.po_number);
+  } catch { record.duplicates = []; }
+  record.attachments_saved = savePdfs(record.conversationId, pdfs);
+}
 
 // Fetch native PDF bytes for a thread's non-inline attachments so the model reads
 // the real PO (incl. scanned PDFs). Read-only. Only called for threads we process.
@@ -184,12 +213,35 @@ async function cmdRun(limit) {
     try { res = await verifyOrder(order); }
     catch (e) { console.log(`  ! ${t.subject?.slice(0, 40)} — verify failed: ${e.message}`); continue; }
     const record = toRecord(t, order, res, classification);
+    if (res.disposition === "order" || res.disposition === "quote") await enrichRecord(record, pdfs);
     store.threads[t.conversationId] = { message_ids: t.message_ids, classification, disposition: res.disposition, record };
-    console.log(`  ✓ ${res.disposition.padEnd(6)} ${t.subject?.slice(0, 50)}  (${classification.label})`);
+    const dupNote = record.duplicates?.length ? " ⚠dup-in-BC" : "";
+    console.log(`  ✓ ${res.disposition.padEnd(6)} ${t.subject?.slice(0, 50)}  (${label})${dupNote}`);
   }
 
   store.generated = new Date().toISOString();
   saveStore(store);
+  renderFromStore(store);
+}
+
+// Enrich the EXISTING cache (no Claude): add the BC duplicate check + save source
+// PDFs for cached order/quote records, then re-render. Cheap way to add these to a
+// backlog already processed. Re-pulls threads to recover attachment ids.
+async function cmdEnrich() {
+  const store = loadStore();
+  const threads = await getThreads();
+  const byConv = Object.fromEntries(threads.map((t) => [t.conversationId, t]));
+  let n = 0;
+  for (const [cid, entry] of Object.entries(store.threads)) {
+    if (!entry.record || (entry.disposition !== "order" && entry.disposition !== "quote")) continue;
+    const pdfs = byConv[cid] ? await hydratePdfs(byConv[cid]) : [];
+    await enrichRecord(entry.record, pdfs);
+    n++;
+    if (entry.record.duplicates?.length) console.log(`  ⚠ dup-in-BC  PO ${entry.record.po_number}  ${entry.record.customer?.name || ""}`);
+  }
+  store.generated = new Date().toISOString();
+  saveStore(store);
+  console.log(`  Enriched ${n} order/quote record(s) with BC duplicate check + saved PDFs.`);
   renderFromStore(store);
 }
 
@@ -213,6 +265,7 @@ async function main() {
   const limit = limFlag !== -1 ? Number(args[limFlag + 1]) : null;
   if (args.includes("--threads")) return cmdThreads();
   if (args.includes("--estimate")) return cmdEstimate(limit);
+  if (args.includes("--enrich")) return cmdEnrich(); // BC dup-check + save PDFs for cached orders
   if (args.includes("--rerender")) return renderFromStore(loadStore()); // re-render cache, no pull
   if (args.includes("--run")) return cmdRun(limit);
   console.log("Usage:\n  pipeline.js --threads          (FREE: pull + group + list threads)\n  pipeline.js --estimate         (token/cost estimate for new threads)\n  pipeline.js --run [--limit N]  (classify+extract+verify new threads, then render)\n  pipeline.js --rerender         (rebuild the page from cache; no pull, no Claude)");

@@ -31,7 +31,7 @@ async function api(method, path, body) {
   return { status: res.status, ok: res.ok, json, text };
 }
 
-async function resolveCompany() {
+export async function resolveCompany() {
   const r = await api("GET", "companies");
   if (!r.ok) throw new Error(`companies -> HTTP ${r.status}`);
   const companies = r.json?.value || [];
@@ -50,7 +50,7 @@ const unwrap = (j) => (j && j.extraction ? j.extraction : j);
 // Duplicate-PO guard: has this PO already been turned into a doc for this customer?
 // Checks open orders, open quotes, and posted invoices for the same
 // externalDocumentNumber + customerNumber. Returns any matches found.
-async function findDuplicates(company, custNumber, poNumber) {
+export async function findDuplicates(company, custNumber, poNumber) {
   if (!custNumber || !poNumber) return [];
   const po = String(poNumber).replace(/'/g, "''");
   const cust = String(custNumber).replace(/'/g, "''");
@@ -154,4 +154,7 @@ function main() {
   return run({ orderPath, doCreate, targetCompany, allowDuplicate });
 }
 
-main();
+// Only run the CLI when executed directly; importing (e.g. findDuplicates from the
+// Step-5 pipeline) must NOT trigger main() — this module can WRITE to BC.
+import { pathToFileURL } from "node:url";
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
