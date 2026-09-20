@@ -31,8 +31,11 @@ const BC_WEB_URL = process.env.BC_WEB_URL || null;     // BC web client base (br
 function bcLink(docType, number) {
   if (!BC_WEB_URL || !number) return null;
   const page = docType === "quote" ? 41 : 42;
-  const q = new URLSearchParams({ company: TARGET_COMPANY || "", page: String(page), filter: `'No.' IS '${number}'` });
-  return `${BC_WEB_URL.replace(/\/$/, "")}?${q.toString()}`;
+  const base = BC_WEB_URL.split("?")[0].replace(/\/$/, ""); // drop any existing ?query and trailing slash
+  // Use %20 (encodeURIComponent), NOT + (URLSearchParams) — the BC filter needs %20.
+  const company = encodeURIComponent(TARGET_COMPANY || "");
+  const filter = encodeURIComponent(`'No.' IS '${number}'`);
+  return `${base}/?company=${company}&page=${page}&filter=${filter}`;
 }
 
 const loadStore = () => { try { return JSON.parse(readFileSync(STORE, "utf8")); } catch { return { threads: {} }; } };
