@@ -128,6 +128,18 @@ function suggestCustomers(order, wantTokens, rows, limit = 3) {
   return scored.slice(0, limit);
 }
 
+// Detect multiple PO numbers merged into one extraction (one email carried 2+ POs,
+// e.g. "MTMX33819; MTMX33818"). We can't reliably assign the merged lines back to
+// each PO, so such an order routes to Needs-review for a human to enter separately.
+// Conservative: only `;`, `&`, or " and " as separators (NOT `/` or `-`, which occur
+// inside real PO numbers), and each side must look like a PO code.
+function multiplePOs(poNumber) {
+  if (!poNumber) return null;
+  const parts = String(poNumber).split(/\s*;\s*|\s*&\s*|\s+and\s+/i).map((s) => s.trim()).filter(Boolean);
+  const poLike = parts.filter((p) => p.length >= 4 && /[A-Za-z0-9][A-Za-z0-9-]{2,}/.test(p));
+  return poLike.length >= 2 ? poLike : null;
+}
+
 // Rule 1 — customer resolves ------------------------------------------------
 // A candidate qualifies iff it contains ALL order name tokens (whole words).
 // Exact normalized-name match takes precedence; ties broken by ship-to geo.
@@ -330,9 +342,12 @@ export async function verifyOrder(order) {
   const gateParts = lines.length > 0 && lines.every((l) => l.rule2);
   const uomIssue = lines.some((l) => l.uomFlag); // non-piece unit -> qty not safe to auto-create
   const allInStock = gateParts && lines.every((l) => l.pass);
+  const multiPO = multiplePOs(order.po_number); // one email carrying 2+ POs
   let disposition, dispositionReason;
   if (lines.length === 0) {
     disposition = "review"; dispositionReason = "no line items extracted";
+  } else if (multiPO) {
+    disposition = "review"; dispositionReason = `multiple PO numbers in one email (${multiPO.join(", ")}) — enter each order separately`;
   } else if (!gateCustomer && !gateParts) {
     disposition = "review"; dispositionReason = `customer not confidently matched, and ${lines.length - resolved} line(s) unresolved`;
   } else if (!gateCustomer) {
