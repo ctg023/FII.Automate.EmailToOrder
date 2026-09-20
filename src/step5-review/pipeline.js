@@ -29,6 +29,7 @@
 import "dotenv/config";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { createHash } from "node:crypto";
 import { collectThreads, fetchAttachmentBytes } from "../ingestion/mailbox.js";
 import { makeClient, extractOne, countOne } from "../step2-extraction/extract.js";
 import { classifyOne } from "../step3-classification/classify.js";
@@ -62,7 +63,9 @@ const getCompany = async () => (_company ||= await resolveCompany());
 // document. Returns [{name, href}] with href relative to out/ (where the page lives).
 function savePdfs(conversationId, pdfs) {
   if (!pdfs.length) return [];
-  const dir = `${PDF_DIR}/${conversationId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40)}`;
+  // Hash the FULL conversationId — Graph ids share a long prefix, so slice(0,40)
+  // collided and mixed different orders' PDFs into one folder.
+  const dir = `${PDF_DIR}/${createHash("sha256").update(conversationId).digest("hex").slice(0, 16)}`;
   mkdirSync(dir, { recursive: true });
   const saved = [];
   for (const p of pdfs) {
@@ -266,6 +269,28 @@ async function reconcileActioned(store) {
   if (returned) console.log(`  ${returned} order(s) returned to the queue (deleted in BC).`);
 }
 
+// Re-run BC verification on cached (non-actioned) orders using the current rules —
+// no Claude, no re-extraction. Picks up verify.js changes (e.g. the UoM gate).
+async function cmdReverify() {
+  const store = loadStore();
+  const targets = Object.values(store.threads).filter((x) => x.record && x.disposition !== "not_order" && x.record.status !== "actioned");
+  console.log(`Re-verifying ${targets.length} cached order(s) against BC (no Claude)…\n`);
+  for (const x of targets) {
+    const r = x.record;
+    const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items };
+    try {
+      const res = await verifyOrder(order);
+      const was = x.disposition;
+      r.rule1 = res.rule1; r.lines = res.lines; r.linesPass = res.linesPass;
+      r.disposition = res.disposition; r.dispositionReason = res.dispositionReason; x.disposition = res.disposition;
+      console.log(`  ${was === res.disposition ? " " : "→"} ${res.disposition.padEnd(6)} PO ${r.po_number} · ${r.customer?.name || ""}${was !== res.disposition ? `  (was ${was})` : ""}`);
+    } catch (e) { console.log(`  ! ${r.po_number}: ${e.message}`); }
+  }
+  store.generated = new Date().toISOString();
+  saveStore(store);
+  renderFromStore(store);
+}
+
 // Standalone reconcile (no pull, no Claude): return BC-deleted orders to the queue.
 async function cmdReconcile() {
   const store = loadStore();
@@ -296,6 +321,7 @@ async function main() {
   if (args.includes("--threads")) return cmdThreads();
   if (args.includes("--estimate")) return cmdEstimate(limit);
   if (args.includes("--enrich")) return cmdEnrich(); // BC dup-check + save PDFs for cached orders
+  if (args.includes("--reverify")) return cmdReverify(); // re-run BC verify on cache (picks up rule changes)
   if (args.includes("--reconcile")) return cmdReconcile(); // return orders deleted in BC to the queue
   if (args.includes("--rerender")) return renderFromStore(loadStore()); // re-render cache, no pull
   if (args.includes("--run")) return cmdRun(limit);

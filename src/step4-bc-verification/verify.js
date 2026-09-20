@@ -241,6 +241,19 @@ async function crossRefItems(company, custNo, partNo) {
   return { ok: true, items: [...found] };
 }
 
+// Units that mean "one piece" (BC base is usually PCS). An order in one of these
+// is safe to treat as a piece count; anything else (100PACK, M=thousand, C=hundred,
+// BOX, CASE, …) is a MULTIPLIER — the raw quantity is NOT pieces, so we can't create
+// it safely and must route the order to a human. Extend as real units appear.
+const PIECE_UOMS = new Set(["EA", "EACH", "EACH.", "PC", "PCS", "PCE", "PIECE", "PIECES", "UN", "UNIT", "UNITS", "ST", "EU"]);
+function uomNeedsReview(orderUom, baseUom) {
+  if (!orderUom) return false;                              // no unit stated -> assume pieces
+  const o = String(orderUom).toUpperCase().trim();
+  if (PIECE_UOMS.has(o)) return false;                     // piece-equivalent
+  if (baseUom && o === String(baseUom).toUpperCase().trim()) return false; // matches BC base exactly
+  return true;                                             // multiplier/other unit -> human must set qty
+}
+
 // Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then inventory.
 async function checkLine(company, line, custNo) {
   const supplier = (line.supplier_part || "").trim();
@@ -286,10 +299,12 @@ async function checkLine(company, line, custNo) {
   }
   const onHand = Number(item.inventory ?? 0);
   const enough = onHand >= qty;
-  const uomNote = line.uom && item.baseUnitOfMeasureCode && line.uom.toUpperCase() !== item.baseUnitOfMeasureCode.toUpperCase()
-    ? ` [UoM check skipped: order "${line.uom}" vs base "${item.baseUnitOfMeasureCode}"]` : "";
+  const uomFlag = uomNeedsReview(line.uom, item.baseUnitOfMeasureCode);
+  const uomNote = uomFlag
+    ? ` [⚠ UoM needs review: order "${line.uom}" is a multiplier, not pieces (base "${item.baseUnitOfMeasureCode}") — quantity not safe to create]`
+    : "";
   return {
-    label, pass: enough, rule2: true, item: item.number, via,
+    label, pass: enough, rule2: true, item: item.number, via, uomFlag,
     detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}`,
   };
 }
@@ -313,6 +328,7 @@ export async function verifyOrder(order) {
   const gateCustomer = r1.pass;
   const resolved = lines.filter((l) => l.rule2).length;
   const gateParts = lines.length > 0 && lines.every((l) => l.rule2);
+  const uomIssue = lines.some((l) => l.uomFlag); // non-piece unit -> qty not safe to auto-create
   const allInStock = gateParts && lines.every((l) => l.pass);
   let disposition, dispositionReason;
   if (lines.length === 0) {
@@ -323,6 +339,10 @@ export async function verifyOrder(order) {
     disposition = "review"; dispositionReason = `customer not confidently matched — ${r1.detail}`;
   } else if (!gateParts) {
     disposition = "review"; dispositionReason = `${lines.length - resolved} of ${lines.length} line(s) not matched to a BC item`;
+  } else if (uomIssue) {
+    disposition = "review";
+    const n = lines.filter((l) => l.uomFlag).length;
+    dispositionReason = `${n} line(s) use a non-piece unit (e.g. 100PACK / M / C) — a human must confirm the quantity before creating`;
   } else if (allInStock) {
     disposition = "order"; dispositionReason = "customer matched; all lines in stock";
   } else {
