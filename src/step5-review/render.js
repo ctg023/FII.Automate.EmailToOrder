@@ -22,6 +22,7 @@
 //   node src/step5-review/render.js --in <f> --out <f>
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -54,6 +55,23 @@ function lineRow(l) {
       </div></div>`;
 }
 
+// The email chain for a thread (live pipeline only): inbound customer mail +
+// outbound rep replies, oldest first, so the rep sees the whole negotiation.
+function conversationBlock(r) {
+  if (!r.conversation?.length) return "";
+  const rows = r.conversation.map((m) => {
+    const who = m.direction === "outbound" ? "Buckeye →" : "→ customer";
+    const body = esc((m.body_text || "").replace(/\s+/g, " ").slice(0, 600));
+    return `<div class="msg ${m.direction === "outbound" ? "out" : "in"}">
+        <div class="msg-h"><b>${esc(m.from || "")}</b> <span class="msg-dir">${who}</span>
+          <span class="msg-when">${esc((m.received || "").slice(0, 16).replace("T", " "))}</span></div>
+        <div class="msg-b">${body}${(m.body_text || "").length > 600 ? "…" : ""}</div>
+      </div>`;
+  }).join("");
+  return `<div class="sec">Conversation (${r.conversation.length} message${r.conversation.length > 1 ? "s" : ""})</div>
+    <div class="thread">${rows}</div>`;
+}
+
 // The action row differs by disposition; buttons are a mock (no handlers).
 function actions(disp) {
   if (disp === "order")
@@ -69,7 +87,7 @@ function actions(disp) {
         <button class="btn ghost">Open original email</button>`;
 }
 
-function card(r) {
+export function card(r) {
   const [badge, cls] = BADGE[r.disposition] || BADGE.review;
   const custName = r.customer?.name || "—";
   const matched = r.rule1?.pass && r.rule1?.match;
@@ -102,6 +120,7 @@ function card(r) {
     </summary>
     <div class="detail">
       <div class="disporeason">${esc(r.dispositionReason || "")}</div>
+      ${conversationBlock(r)}
       <div class="sec">Customer match</div>
       <div class="check">
         <span class="dot ${custDot}">${custMark}</span>
@@ -118,7 +137,7 @@ function card(r) {
   </details>`;
 }
 
-function page(data) {
+export function page(data) {
   const records = data.records || [];
   const tally = data.tally || records.reduce((t, r) => ((t[r.disposition] = (t[r.disposition] || 0) + 1), t), {});
   const when = data.generated ? new Date(data.generated).toLocaleString("en-US") : new Date().toLocaleString("en-US");
@@ -169,6 +188,12 @@ function page(data) {
   .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer}
   .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}.btn.primary:disabled{opacity:.4;cursor:not-allowed}
   .btn.ghost{background:transparent}
+  .thread{display:flex;flex-direction:column;gap:6px;margin:2px 0 4px}
+  .msg{border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12.5px;background:var(--panel)}
+  .msg.out{border-left:3px solid var(--accent)}.msg.in{border-left:3px solid var(--ok)}
+  .msg-h{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+  .msg-dir{font-size:11px;color:var(--muted)}.msg-when{margin-left:auto;color:var(--muted);font-size:11px}
+  .msg-b{color:var(--muted);margin-top:3px;line-height:1.45}
   code{background:var(--chip);padding:1px 5px;border-radius:5px;font-size:12.5px}</style></head><body><div class="wrap">
 <header><h1>Order Review Queue</h1>
 <p>Prototype · orders read from the <code>orders@</code> mailbox, extracted, and checked against Business Central. ${records.length} order(s) · generated ${esc(when)}.</p></header>
@@ -206,4 +231,5 @@ function main() {
   console.log("  (Prototype — buttons are a mock; contains customer PII, keep in out/ and out of git.)");
 }
 
-main();
+// Only run the CLI when executed directly; importing (e.g. from pipeline.js) does not.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

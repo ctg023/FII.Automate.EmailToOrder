@@ -48,7 +48,9 @@ export function loadAnswerKey(id) {
   return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : null;
 }
 
-/** Build the user prompt text from an email + its attachment text. */
+/** Build the user prompt TEXT from an email + any attachments that arrived as
+ *  extracted text (sample set). Binary attachments (with .bytes) are NOT inlined
+ *  here — they go as separate document blocks via buildMessageContent(). */
 export function buildUserContent(sample) {
   const { email, attachments } = sample;
   const parts = [];
@@ -61,15 +63,35 @@ export function buildUserContent(sample) {
   parts.push("");
   parts.push("EMAIL BODY:");
   parts.push(email.body_text || "(empty)");
-  for (const att of attachments) {
+  for (const att of attachments || []) {
+    if (!att.text) continue; // binary attachments handled as document blocks
     parts.push("");
     parts.push(`--- ATTACHMENT: ${att.name} ---`);
     parts.push(att.text);
   }
-  // TODO(native files): when a real PDF exists for this sample, return content
-  // blocks instead of a string: [{type:"document", source:{type:"base64",
-  // media_type:"application/pdf", data:<b64>}}, {type:"text", text:<the header>}].
   return parts.join("\n");
+}
+
+// Is this attachment a PDF we can send as a native document block? Handles the
+// common octet-stream mislabel by falling back to the .pdf filename.
+function isPdf(att) {
+  const ct = (att.contentType || "").toLowerCase();
+  return ct === "application/pdf" || /\.pdf$/i.test(att.name || "");
+}
+const MAX_DOC_B64 = 24 * 1024 * 1024; // ~18MB decoded; skip larger to stay under API limits
+
+/** User message content for the API: a plain string when there are no binary
+ *  attachments, otherwise a blocks array = [text header/body, ...PDF documents].
+ *  Native PDFs (incl. scanned ones) are read directly by the model. */
+export function buildMessageContent(sample) {
+  const text = buildUserContent(sample);
+  const pdfs = (sample.attachments || []).filter((a) => a.bytes && isPdf(a) && a.bytes.length <= MAX_DOC_B64);
+  if (!pdfs.length) return text;
+  const blocks = [{ type: "text", text }];
+  for (const a of pdfs) {
+    blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: a.bytes } });
+  }
+  return blocks;
 }
 
 /** Run extraction for one sample. Returns { parsed_output, usage, model }. */
@@ -84,7 +106,7 @@ export async function extractOne(client, sample, opts = {}) {
       format: zodOutputFormat(OrderExtraction),
       effort, // extraction is not deep reasoning; medium keeps cost down
     },
-    messages: [{ role: "user", content: buildUserContent(sample) }],
+    messages: [{ role: "user", content: buildMessageContent(sample) }],
   });
   return { parsed_output: res.parsed_output, usage: res.usage, model, stop_reason: res.stop_reason };
 }
@@ -95,7 +117,7 @@ export async function countOne(client, sample, opts = {}) {
   const res = await client.messages.countTokens({
     model,
     system: SYSTEM,
-    messages: [{ role: "user", content: buildUserContent(sample) }],
+    messages: [{ role: "user", content: buildMessageContent(sample) }],
   });
   return res.input_tokens;
 }

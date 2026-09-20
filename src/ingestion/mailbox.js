@@ -23,6 +23,7 @@
 import "dotenv/config";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 const TENANT = process.env.GRAPH_TENANT_ID, CLIENT = process.env.GRAPH_CLIENT_ID;
 const SECRET = process.env.GRAPH_CLIENT_SECRET, MAILBOX = process.env.GRAPH_MAILBOX;
@@ -63,17 +64,17 @@ function saveState(state) {
 
 const mbPath = () => `/users/${encodeURIComponent(MAILBOX)}`;
 
-// Read-only: list recent Inbox messages (metadata only).
-async function listMessages(limit) {
-  const sel = "id,receivedDateTime,from,subject,hasAttachments,bodyPreview";
-  const r = await gget(`${mbPath()}/mailFolders/Inbox/messages?$select=${sel}&$top=${limit}&$orderby=receivedDateTime desc`);
-  if (!r.ok) throw new Error(`list -> HTTP ${r.status}: ${(r.text || "").slice(0, 400)}`);
+// Read-only: list recent messages in a folder (metadata only). Default Inbox.
+async function listMessages(limit, folder = "Inbox") {
+  const sel = "id,conversationId,receivedDateTime,from,toRecipients,subject,hasAttachments,bodyPreview";
+  const r = await gget(`${mbPath()}/mailFolders/${folder}/messages?$select=${sel}&$top=${limit}&$orderby=receivedDateTime desc`);
+  if (!r.ok) throw new Error(`list ${folder} -> HTTP ${r.status}: ${(r.text || "").slice(0, 400)}`);
   return r.json?.value || [];
 }
 
 // Read-only: full message body + attachments (native contentBytes) for one message.
 async function fetchMessage(id) {
-  const msg = await gget(`${mbPath()}/messages/${id}?$select=id,receivedDateTime,from,subject,body,hasAttachments`);
+  const msg = await gget(`${mbPath()}/messages/${id}?$select=id,conversationId,receivedDateTime,from,toRecipients,subject,body,hasAttachments`);
   const atts = msg.json?.hasAttachments
     ? (await gget(`${mbPath()}/messages/${id}/attachments?$select=id,name,contentType,size,isInline`)).json?.value || []
     : [];
@@ -81,6 +82,59 @@ async function fetchMessage(id) {
 }
 
 const senderOf = (m) => m?.from?.emailAddress?.address || "(unknown)";
+
+// Read-only: fetch one attachment's native bytes (base64) for a message. Used by
+// the Step-5 pipeline to send real PDFs to the model. Returns null on failure.
+export async function fetchAttachmentBytes(messageId, attachmentId) {
+  const r = await gget(`${mbPath()}/messages/${encodeURIComponent(messageId)}/attachments/${attachmentId}`);
+  if (!r.ok || !r.json) return null;
+  return { name: r.json.name, contentType: r.json.contentType, contentBytes: r.json.contentBytes || null };
+}
+
+// Read-only: collect recent messages across folders (Inbox = inbound customer mail,
+// SentItems = outbound rep replies), fetch each full body, and group into threads by
+// Graph conversationId — so a PO and its whole back-and-forth are one unit. Never
+// mutates the mailbox. Returns threads newest-activity-first. Used by the Step-5 live
+// review runner (src/step5-review/pipeline.js).
+export async function collectThreads({ limit = 50, folders = ["Inbox", "SentItems"] } = {}) {
+  const byConv = new Map();
+  for (const folder of folders) {
+    const direction = folder.toLowerCase().includes("sent") ? "outbound" : "inbound";
+    let heads = [];
+    try { heads = await listMessages(limit, folder); }
+    catch (e) { if (direction === "outbound") continue; throw e; } // Sent optional; skip if absent
+    for (const h of heads) {
+      const { msg, atts } = await fetchMessage(h.id);
+      if (!msg) continue;
+      const conv = msg.conversationId || msg.id;
+      const rec = {
+        message_id: msg.id, conversationId: conv, direction,
+        received: msg.receivedDateTime, from: senderOf(msg),
+        to: (msg.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean),
+        subject: msg.subject,
+        body_text: (msg.body?.contentType === "html" ? htmlToText(msg.body?.content) : msg.body?.content) || "",
+        attachments: atts.map((a) => ({ id: a.id, name: a.name, contentType: a.contentType, size: a.size, isInline: a.isInline })),
+      };
+      if (!byConv.has(conv)) byConv.set(conv, []);
+      byConv.get(conv).push(rec);
+    }
+  }
+  const threads = [];
+  for (const [conversationId, msgs] of byConv) {
+    msgs.sort((a, b) => (a.received || "").localeCompare(b.received || ""));
+    const last = msgs[msgs.length - 1];
+    threads.push({
+      conversationId,
+      subject: msgs.find((m) => m.subject)?.subject || "(no subject)",
+      messages: msgs,
+      last_received: last?.received || null,
+      has_attachments: msgs.some((m) => m.attachments.length),
+      message_ids: msgs.map((m) => m.message_id),
+    });
+  }
+  threads.sort((a, b) => (b.last_received || "").localeCompare(a.last_received || ""));
+  return threads;
+}
 
 async function cmdList(limit) {
   const msgs = await listMessages(limit);
@@ -113,7 +167,13 @@ async function cmdPull(limit, outDir) {
     };
     console.log(`  • ${record.received?.slice(0, 16).replace("T", " ")}  ${record.from}  "${record.subject}"  (${atts.length} attachment(s))`);
     if (outDir) {
-      const safe = record.message_id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
+      // Filename must be UNIQUE per message. Graph ids share a long common prefix,
+      // so a truncated id collides and silently overwrites other records; key the
+      // name on a stable hash of the FULL id instead (a re-pull of the same message
+      // overwrites itself, which is correct; different messages never collide).
+      const hash = createHash("sha256").update(record.message_id).digest("hex").slice(0, 16);
+      const day = (record.received || "").slice(0, 10) || "nodate"; // readable prefix
+      const safe = `${day}_${hash}`;
       writeFileSync(join(outDir, `${safe}.json`), JSON.stringify(record, null, 2));
       // Native attachment bytes are available on each attachment (contentBytes); a
       // later stage saves/extracts them. Kept out of the record to avoid bloat/PII.
@@ -173,4 +233,9 @@ async function main() {
   console.log("Usage:\n  mailbox.js --check                      (diagnose whether Graph access is set up)\n  mailbox.js --list [--limit N]           (read-only preview)\n  mailbox.js --pull [--limit N] [--out <dir>]  (emit new messages, update local state)");
 }
 
-main().catch((e) => { console.error(e.message || e); process.exit(1); });
+// Only run the CLI when executed directly; importing (e.g. collectThreads from the
+// Step-5 pipeline) must NOT trigger main().
+import { pathToFileURL } from "node:url";
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => { console.error(e.message || e); process.exit(1); });
+}

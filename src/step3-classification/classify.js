@@ -3,7 +3,7 @@
 // input (email body + any attachment text) is built identically.
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import {
-  buildUserContent, DEFAULT_MODEL, DEFAULT_EFFORT,
+  buildMessageContent, DEFAULT_MODEL, DEFAULT_EFFORT,
 } from "../step2-extraction/extract.js";
 import { Classification } from "./schema.js";
 
@@ -26,7 +26,7 @@ export async function classifyOne(client, sample, opts = {}) {
     max_tokens: 1024,
     system: SYSTEM,
     output_config: { format: zodOutputFormat(Classification), effort },
-    messages: [{ role: "user", content: buildUserContent(sample) }],
+    messages: [{ role: "user", content: buildMessageContent(sample) }],
   });
   return { parsed_output: res.parsed_output, usage: res.usage, model, stop_reason: res.stop_reason };
 }
