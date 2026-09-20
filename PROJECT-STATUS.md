@@ -13,7 +13,7 @@ end-to-end** against live BC (selftest: clean order → APPROVE-READY, bad line 
 | 2 | Test extraction accuracy in isolation | ✅ Done (initial) — 100% on the first 12 order samples (source-audited keys), ~$0.31/run. Harness in `src/step2-extraction/`. S24–S50 keys drafted (verified:false); re-run to score the larger set |
 | 3 | Test order / not-order / unsure classification | ✅ Done — 92% (46/50); **order recall 100%, 0 missed orders**; errors only on not_order↔unsure boundary. Harness in `src/step3-classification/`, ~$0.41/run on Opus. Labels S24–S50 are drafted (verified:false) |
 | 4 | Confirm BC prerequisites + build read-only verification checks | 🟡 In progress — connectivity proven (`ping.js`), data-quality probed (`data-quality.js`), **v1 rules cataloged (`VERIFICATION-RULES.md`) and running (`verify.js`)**. One BC-side blocker: Item Reference table not exposed (see below) |
-| 5 | Review-queue web app (Teams tab) | 🟡 **Static prototype done** — `src/step5-review/render.js` renders the Step-4 `verify.js --json` output into the review page: queue grouped by disposition (Order / Quote / Needs-review) with a stats header, per-order customer-match result, per-line part+stock checks, and a **"Did you mean…" customer pick-list** for unresolved matches. Read-only/offline; **buttons are a mock** (no BC write). Output embeds real customer data → written to git-ignored `out/` (never commit). A prior session hand-rendered this into a scratchpad `review.html`; that one-off is now reproducible from committed code. **Not yet a live web app** — no server, auth, or wired actions. Next: the actual Teams-tab app (hosting still open — see Recommended) |
+| 5 | Review-queue web app (Teams tab) | 🟢 **LIVE end-to-end (v1).** `pipeline.js` pulls `order@` Inbox, groups messages into **threads by conversationId** (Inbox-only — reps reply from their own mailboxes, so Sent isn't captured), then classify→extract (**native PDF passthrough**)→verify, caching per-thread in `out/review-store.json` (incremental; **Sonnet 5** default). `server.js` serves the interactive page at `:8787`: **Approve = dry-run preview → inline confirm → guarded real create** to BC260TEST/Fasteners; created docs leave the queue, **deep-link to BC** (`BC_WEB_URL`), are **reconciled** (return to queue if the BC doc is deleted), and cards flag **PO-already-in-BC** + link the source PDF. `render.js` uses an **inline** confirm panel (native `confirm()` was auto-dismissed in some browsers). Proven live: created Sales Order 231177 (Mack Hils) + a Quote. **Still open:** no server **auth**; standalone Node now (IIS reverse proxy later — accepted on-prem, changeable); perf — `verifyOrder` re-pulls customers/items per call (slow preview), cache later |
 | 6 | Order creation against BC sandbox | 🟡 **Write PROVEN incl. email number series** — `create.js` created Sales Order **S-ORD-EMAIL00001** in Fasteners from S01 (customer 91333700, PO 114543, `SN 1409`×11000 PCS, $697.40, open/not released) via the **EMAILORDER** service user. **Numbering decided: the `Email Order No. Series` AL subscriber** (BC stamps S-ORD-EMAIL/S-QUO-EMAIL for the EMAILORDER user and owns the sequence; regular series untouched). App-side manual-number path **removed** from create.js — it posts without a number. Dry-run default; write double-guarded (`--create`+`--company`). (The manual `--manual-number` path was tested/worked but is retired.) **Quote path also proven** — created **S-QUO-EMAIL00001** (Metal-Core 00017997, PO MCA025008, `BF W705182`×150000 PCS, $11,700). Both Order and Quote write correctly (quotes use `documentDate`, orders `orderDate`). **Duplicate-PO guard done** — pre-create check across orders/quotes/invoices for PO#+customer; refuses on `--create` unless `--allow-duplicate` (a PO+customer match can be a legit release order, so it's a refuse-by-default net; precise per-email dedup = message-id store at ingestion). Pending: **deploy the codeunit** (then Manual Nos. can go back OFF on the default series); UoM multiplier handling if non-EA units appear |
 | 7 | Pilot with 1–2 reps | Later |
 
@@ -37,12 +37,24 @@ human-approved, sandbox-first write.
 - **Web app hosting:** IIS reverse proxy → standalone Node Windows service (not `iisnode`). Fallback: Node serves HTTPS directly.
 
 ## Open items / needed from Corey
-Track A (live mailbox ingestion) — **code built** (`src/ingestion/mailbox.js`, read-only), needs M365 setup:
-- ⛔ **Entra app registration** for Graph, then `.env` (GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET/MAILBOX).
-  Setup spec in `src/ingestion/README.md`.
-- ⚠️ **Auth-model decision:** built as **app-only `Mail.Read` (application permission)** + Application Access
-  Policy scoping to `orders@` — the right model for an unattended VM service. This differs from the earlier
-  CLAUDE.md note of delegated `Mail.Read.Shared` (which needs an interactive user). Confirm app-only is OK.
+Track A (live mailbox ingestion) — ✅ **LIVE.** Entra app registration created; `.env` `GRAPH_*` set;
+`mailbox.js --check` green against **`order@buckeyefasteners.com`** (singular "order"). App-only `Mail.Read`
+(application permission, admin-consented) — confirmed the right model for the unattended VM service.
+- ⛔ **Application Access Policy NOT yet applied** — until it is, the app-only `Mail.Read` can read **every**
+  mailbox in the tenant. Fence it to `order@` via Exchange Online PowerShell (New-ApplicationAccessPolicy;
+  spec in `src/ingestion/README.md`). **Must do before pilot.** (Deliberately deferred to unblock testing.)
+- ℹ️ Reps reply from their **own** mailboxes, not `order@`, so the shared mailbox's Sent Items has no rep
+  side — the live app reads **Inbox only** and groups threads by `conversationId`.
+
+Live review app (Step 5/6) — open before pilot:
+- ⛔ **Server auth** — `server.js` has none yet (fine on the internal dev box; needed before reps use it).
+- ⛔ **`EMAILORDER` No.-Series AL codeunit not deployed** — until the developer deploys it, BC assigns the
+  **default** sales-order/quote series (created order 231177 got a default number, not S-ORD-EMAIL). App is
+  correct (posts without a number; BC numbers it). No app change needed once the codeunit lands.
+- 🟡 **Accuracy pass** on the live backlog not yet done (spot-checked only). Validate extractions/dispositions
+  before pilot.
+- 🟡 **Perf:** `verifyOrder` re-pulls all customers + item index on every call → multi-second preview/approve.
+  Cache the customer/item data for the live app later.
 
 BC-side items (some now confirmed from the live probe on 2026-09-17):
 - ✅ BC connectivity confirmed — NavUserPassword auth works; OData API v2.0 published; read access on
@@ -77,6 +89,19 @@ BC-side items (some now confirmed from the live probe on 2026-09-17):
 - ℹ️ Noted: `inventory` is a FlowField — cannot be `$filter`ed server-side (HTTP 400); read the item and
   compare in code (verify.js already does this).
 - A BC **sandbox/test company** for order-creation testing (never production first) — still needed for Step 6.
+
+Backlog / future features (discussed, not started):
+- **Item-level quote history / rate-shopping visibility.** Reps get burned by customers rate-shopping the
+  same part across distributors. Idea: key a history by the **resolved BC item number** (verify.js already
+  gives it per line) and show, on a quote, prior activity for that item. Two data sources, answering different
+  questions: (1) **from our emails/store** — every thread that requested an item, which customer + when, with a
+  link back to the source email/PDF (a rate-shop *demand* signal; cheap, data already captured; catches the
+  same end-buyer shopping via different distributors even when their PNs differ); (2) **from BC** — the actual
+  **quoted price** to other customers (authoritative), which likely needs a **published BC page/query for quote
+  (+archived quote) lines**, same pattern as `Item_References_Excel`. ⚠️ Key gotcha: the price **we** quoted is
+  NOT in the inbound email (customer is asking us to price) — it lives in BC (once a quote exists) or the rep's
+  **Sent** reply (which we don't capture). Open Qs: show "who's asking" vs "what we quoted"; inline per-line vs
+  a standalone item-history lookup; cross-customer price visibility is a business/policy call.
 
 Optional / low-priority:
 - Export **native binaries for S12 & S13** (scanned/mislabeled PDFs) to test the native-PDF path.

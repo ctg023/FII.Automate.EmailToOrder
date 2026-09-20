@@ -10,22 +10,32 @@ created in BC. Goal: cut manual order entry for ~10 reps while keeping a human i
 
 **A human approves every order before it is created in BC. No auto-create — ever, at least through rollout.**
 
-## Status (2026-09-18)
+## Status (2026-09-20)
 See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed status — keep that current too.
 - **Step 1 (sample set):** done — 50 labeled sample emails in `samples/` (29 order, 8 ambiguous, 13 not_order).
-- **Step 2 (extraction):** done — harness in `src/step2-extraction/`; ~100% on order content.
+- **Step 2 (extraction):** done — harness in `src/step2-extraction/`; ~100% on order content. Now also sends
+  **native PDF bytes** as document blocks (`buildMessageContent`), so real/scanned PDFs are read directly.
 - **Step 3 (classification):** done — harness in `src/step3-classification/`; 92%, **0 dropped orders**.
 - **Step 4 (BC verification):** done (read-only v1) — `src/step4-bc-verification/verify.js` resolves customer
   (Rule 1) + line items via direct/cross-ref (Rule 2) + stock (Rule 3), and assigns a **disposition**
   (Order / Quote / Needs-review). `--batch <dir> --json <out>` emits structured per-order records.
-- **Step 5 (review UI):** prototype — `src/step5-review/render.js` turns the Step-4 `--json` output into the
-  static review page (queue grouped by disposition, per-line checks, customer "did you mean" pick-list).
-  Buttons are a **mock**; the page embeds PII so it renders to git-ignored `out/`. Not yet a live web app.
-- **Step 6 (order creation):** write **proven** vs a BC dev/test company — `src/step6-order-creation/create.js`
-  created a Sales Order and a Quote (dry-run by default; double-guarded `--create`+`--company`). Still gated
-  behind human approval; sandbox-first.
-- **Ingestion (Track A):** read-only mailbox pull built — `src/ingestion/mailbox.js` (needs Entra app + `.env`).
-- Later: turn the Step-5 prototype into the real review web app (Teams tab); pilot with 1–2 reps.
+- **Step 5 (review app):** **LIVE, end-to-end.**
+  - `pipeline.js` — live runner: pulls `order@` Inbox, groups messages into **threads by conversationId**
+    (Inbox-only — reps reply from their own mailboxes, so Sent isn't captured), classify→extract(w/ PDFs)→
+    verify, **incremental cache** in `out/review-store.json`. Model defaults to **Sonnet 5**. Non-orders hidden.
+  - `render.js` — renders the queue; interactive mode wires the buttons.
+  - `server.js` — Node service serving the live page. **Approve = dry-run preview → INLINE confirm →
+    guarded create** to BC260TEST/Fasteners (writes a real Sales Order/Quote). Created docs are marked
+    actioned (leave the queue), **deep-link back to BC** (needs `BC_WEB_URL`), and are **reconciled** — if the
+    BC doc is later deleted the order returns to the queue. Cards flag **PO-already-in-BC** and link the source PDF.
+- **Step 6 (order creation):** write **proven** — `src/step6-order-creation/create.js`; `createDoc()` is the
+  programmatic path the server calls. Dry-run default; guarded real write. ⚠️ BC assigns a **default** number
+  series until the `EMAILORDER` No.-Series **AL codeunit is deployed** (developer task — then S-ORD-EMAIL/S-QUO-EMAIL).
+- **Ingestion (Track A):** **LIVE** — Entra app + `.env` done; `mailbox.js --check` green; reads
+  `order@buckeyefasteners.com` (singular). ⚠️ **Application Access Policy fence NOT yet applied** (app can read
+  ALL mailboxes) — must do before pilot.
+- Next: server **auth** (none yet), mailbox **Access Policy fence**, **accuracy pass** on the live backlog;
+  then pilot with 1–2 reps. Backlog idea: **item-level quote history / rate-shopping visibility** (see PROJECT-STATUS).
 
 ## Stack & architecture
 - **Node.js (ESM)** throughout. No build step; run `.js` directly with `node`.
@@ -41,8 +51,9 @@ src/ingestion/            # mailbox.js = read-only Graph pull from orders@ (Trac
 src/step2-extraction/     # extraction harness (schema.js, extract.js, score.js, run.js)
 src/step3-classification/ # order/not_order/unsure classifier (same shape)
 src/step4-bc-verification/# ping.js (connectivity), data-quality.js, verify.js (read-only rules + disposition)
-src/step5-review/         # render.js = Step-4 --json output -> static review page (prototype; mock buttons)
-src/step6-order-creation/ # create.js = BC Sales Order / Quote write (dry-run default, double-guarded)
+src/step5-review/         # LIVE review app: pipeline.js (ingest→classify→extract→verify→cache),
+                          #   render.js (page), server.js (serves page + approve/preview/refresh endpoints)
+src/step6-order-creation/ # create.js = BC Sales Order / Quote write; createDoc()/docExists() exported for server
 samples/                  # test set. README + extraction-schema.json are committed;
                           #   raw/, answer-keys/, manifest.csv, FINDINGS.md are git-ignored (customer data)
 out/                      # git-ignored render/verify output (contains PII) — e.g. verified.json, review.html
@@ -62,11 +73,19 @@ node src/step2-extraction/run.js --sample S03         # run ONE (safe default)
 node src/step2-extraction/run.js --all                # run all, then --rescore is free
 node src/step3-classification/run.js --all            # classifier
 node src/step4-bc-verification/ping.js                # BC read-only smoke test (needs BC_* in .env)
-# Review pipeline (read-only): verify the sample orders, then render the review UI.
+# Sample-set review page (read-only): verify the sample orders, then render.
 node src/step4-bc-verification/verify.js --batch samples/answer-keys --json out/verified.json
 node src/step5-review/render.js --in out/verified.json --out out/review.html
-start out/review.html                                 # open the review page
+# LIVE review app (reads order@; writes to BC only on human Approve):
+node src/step5-review/pipeline.js --threads              # FREE: pull + group live threads
+node src/step5-review/pipeline.js --estimate --limit 3   # cost projection for new threads
+node src/step5-review/pipeline.js --run [--limit N]      # classify+extract+verify new threads (Sonnet)
+node src/step5-review/pipeline.js --reconcile            # return BC-deleted orders to the queue
+node src/step5-review/server.js                          # serve interactive app at http://localhost:8787
 ```
+The server needs `BC_*` (+ `BC_WEB_URL` for deep links) and `$env:NODE_OPTIONS`. Approve does a dry-run
+preview then a guarded write to `BC_COMPANY` (BC260TEST/Fasteners). It runs as a standalone Node service;
+IIS reverse proxy sits in front later (accepted on-prem, changeable). **No server auth yet.**
 (Bash/CI equivalent for the env var: prefix a command with `NODE_OPTIONS=--use-system-ca node ...`.)
 Guardrail: harnesses run nothing without an explicit `--sample`/`--all`/`--estimate` flag.
 Reminder: `create.js --create` (Step 6) is the only thing that WRITES to BC; the review pipeline never does.
@@ -92,7 +111,13 @@ Reminder: `create.js --create` (Step 6) is the only thing that WRITES to BC; the
   said WSAK; that was wrong). When the company moves to BC **SaaS (~Feb 2027)** this one auth layer swaps
   to **OAuth 2.0 Service-to-Service** (Entra app registration). Don't build OAuth now.
 - BC API: standard **OData v4 / API v2.0** endpoints, read-only for verification; order creation later, sandbox first.
-- **Mailbox** is an Exchange Online shared mailbox; read via **Microsoft Graph** (`Mail.Read.Shared`).
+- **Mailbox** is the Exchange Online shared mailbox **`order@buckeyefasteners.com`** (singular "order"),
+  read via **Microsoft Graph, app-only `Mail.Read`** (application permission, admin-consented) — a dedicated
+  Entra app registration for the unattended VM service (NOT delegated `Mail.Read.Shared`). Entra app + `.env`
+  `GRAPH_*` are set and working. ⚠️ **Application Access Policy to fence the app to `order@` is NOT yet applied**
+  (until it is, the app can read every mailbox in the tenant) — do before pilot. See `src/ingestion/README.md`.
+- **BC write target** for the live app = **BC260TEST / `Fasteners`** (`BC_COMPANY`), a dev/test instance —
+  never production first. `BC_WEB_URL` (browser base URL) drives the review app's deep links back to BC.
 
 ## Data & integration notes
 - The M365 Graph connector returns attachment **extracted text, not native files**; **scanned or
