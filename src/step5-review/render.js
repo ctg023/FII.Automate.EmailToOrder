@@ -270,7 +270,8 @@ document.addEventListener('click', async (e)=>{
     res.innerHTML='Creating in BC…';
     const out = await post('/api/approve',{conversationId:card.dataset.cid, allowDuplicate: confirmBtn.dataset.dup==='true'});
     if(out.ok && out.created){
-      res.innerHTML='✅ Created '+esc(out.docType)+' <b>'+esc(out.number)+'</b> in '+esc(out.company)+' (open, not released). You can close this.';
+      const num = out.url ? '<a href="'+out.url+'" target="_blank" rel="noopener"><b>'+esc(out.number)+'</b></a>' : '<b>'+esc(out.number)+'</b>';
+      res.innerHTML='✅ Created '+esc(out.docType)+' '+num+' in '+esc(out.company)+' (open, not released). You can close this.';
       card.classList.add('done'); const a=card.querySelector('[data-act="approve"]'); if(a) a.disabled=true;
     } else { res.textContent='Not created: '+(out.reason||'unknown'); }
     return;

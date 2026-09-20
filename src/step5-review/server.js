@@ -24,6 +24,16 @@ const PORT = Number(process.env.REVIEW_PORT || 8787);
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
 const PDF_ROOT = resolve("out/pdfs");
 const TARGET_COMPANY = process.env.BC_COMPANY || null; // the sandbox company to write to
+const BC_WEB_URL = process.env.BC_WEB_URL || null;     // BC web client base (browser URL), for deep links
+
+// Deep link to open a created doc in the BC web client. Sales Quote = page 41,
+// Sales Order = page 42. Needs BC_WEB_URL set (the browser URL, not the API URL).
+function bcLink(docType, number) {
+  if (!BC_WEB_URL || !number) return null;
+  const page = docType === "quote" ? 41 : 42;
+  const q = new URLSearchParams({ company: TARGET_COMPANY || "", page: String(page), filter: `'No.' IS '${number}'` });
+  return `${BC_WEB_URL.replace(/\/$/, "")}?${q.toString()}`;
+}
 
 const loadStore = () => { try { return JSON.parse(readFileSync(STORE, "utf8")); } catch { return { threads: {} }; } };
 const saveStore = (s) => { import("node:fs").then(({ writeFileSync }) => writeFileSync(STORE, JSON.stringify(s, null, 2))); };
@@ -84,7 +94,9 @@ async function handle(req, res) {
       const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate });
       if (out.ok && out.created) { // mark actioned so it leaves the open queue
         entry.record.status = "actioned"; entry.record.bc_number = out.number; entry.record.bc_docType = out.docType;
+        entry.record.bc_url = bcLink(out.docType, out.number);
         saveStore(store);
+        out.url = entry.record.bc_url;
       }
       return json(res, 200, out);
     } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
