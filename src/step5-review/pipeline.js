@@ -33,7 +33,7 @@ import { collectThreads, fetchAttachmentBytes } from "../ingestion/mailbox.js";
 import { makeClient, extractOne, countOne } from "../step2-extraction/extract.js";
 import { classifyOne } from "../step3-classification/classify.js";
 import { verifyOrder } from "../step4-bc-verification/verify.js";
-import { findDuplicates, resolveCompany } from "../step6-order-creation/create.js";
+import { findDuplicates, resolveCompany, docExists } from "../step6-order-creation/create.js";
 import { page } from "./render.js";
 
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
@@ -219,6 +219,7 @@ async function cmdRun(limit) {
     console.log(`  ✓ ${res.disposition.padEnd(6)} ${t.subject?.slice(0, 50)}  (${label})${dupNote}`);
   }
 
+  await reconcileActioned(store); // return any orders whose BC doc was deleted
   store.generated = new Date().toISOString();
   saveStore(store);
   renderFromStore(store);
@@ -245,10 +246,39 @@ async function cmdEnrich() {
   renderFromStore(store);
 }
 
+// Reconcile actioned orders against BC: if a created doc was later DELETED in BC,
+// clear its actioned flag so it returns to the review queue. On any BC error we
+// leave it actioned (don't resurrect on a transient blip). Read-only against BC.
+async function reconcileActioned(store) {
+  const actioned = Object.values(store.threads).filter((x) => x.record?.status === "actioned" && x.record.bc_number);
+  if (!actioned.length) return;
+  const company = await getCompany();
+  let returned = 0;
+  for (const x of actioned) {
+    let exists = true;
+    try { exists = await docExists(company, x.record.bc_docType, x.record.bc_number); } catch { exists = true; }
+    if (!exists) {
+      console.log(`  ↩ ${x.record.bc_docType} ${x.record.bc_number} gone from BC — returning PO ${x.record.po_number} to review`);
+      delete x.record.status; delete x.record.bc_number; delete x.record.bc_docType;
+      returned++;
+    }
+  }
+  if (returned) console.log(`  ${returned} order(s) returned to the queue (deleted in BC).`);
+}
+
+// Standalone reconcile (no pull, no Claude): return BC-deleted orders to the queue.
+async function cmdReconcile() {
+  const store = loadStore();
+  await reconcileActioned(store);
+  store.generated = new Date().toISOString();
+  saveStore(store);
+  renderFromStore(store);
+}
+
 // Build the review page from every cached thread that isn't a not_order.
 function renderFromStore(store) {
   const records = Object.values(store.threads)
-    .filter((x) => x.record && x.disposition !== "not_order")
+    .filter((x) => x.record && x.disposition !== "not_order" && x.record.status !== "actioned")
     .map((x) => x.record)
     .sort((a, b) => (b.last_received || "").localeCompare(a.last_received || ""));
   const tally = records.reduce((t, r) => ((t[r.disposition] = (t[r.disposition] || 0) + 1), t), {});
@@ -266,9 +296,10 @@ async function main() {
   if (args.includes("--threads")) return cmdThreads();
   if (args.includes("--estimate")) return cmdEstimate(limit);
   if (args.includes("--enrich")) return cmdEnrich(); // BC dup-check + save PDFs for cached orders
+  if (args.includes("--reconcile")) return cmdReconcile(); // return orders deleted in BC to the queue
   if (args.includes("--rerender")) return renderFromStore(loadStore()); // re-render cache, no pull
   if (args.includes("--run")) return cmdRun(limit);
-  console.log("Usage:\n  pipeline.js --threads          (FREE: pull + group + list threads)\n  pipeline.js --estimate         (token/cost estimate for new threads)\n  pipeline.js --run [--limit N]  (classify+extract+verify new threads, then render)\n  pipeline.js --rerender         (rebuild the page from cache; no pull, no Claude)");
+  console.log("Usage:\n  pipeline.js --threads          (FREE: pull + group + list threads)\n  pipeline.js --estimate         (token/cost estimate for new threads)\n  pipeline.js --run [--limit N]  (classify+extract+verify new threads, reconcile, then render)\n  pipeline.js --enrich           (BC dup-check + save PDFs for cached orders)\n  pipeline.js --reconcile        (return orders deleted in BC to the queue)\n  pipeline.js --rerender         (rebuild the page from cache; no pull, no Claude)");
 }
 
 main().catch((e) => { console.error(e.message || e); process.exit(1); });

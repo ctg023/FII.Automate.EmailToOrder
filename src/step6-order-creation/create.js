@@ -79,6 +79,49 @@ function buildDoc(order, res) {
   return { docType: res.disposition, ent, lineEnt, header, lines };
 }
 
+// Programmatic create — for the Step-5 review server. Returns a structured result
+// (never console/exit). doCreate=false = dry-run preview (build doc + duplicate
+// check, write nothing). doCreate=true = guarded real write to the sandbox: the
+// caller must pass targetCompany matching the resolved company, exactly like the CLI.
+// Does a created doc still exist in BC? Used by the review app to return an order
+// to the queue if its BC document was later deleted. Read-only.
+export async function docExists(company, docType, number) {
+  if (!number) return false;
+  const ent = docType === "quote" ? "salesQuotes" : "salesOrders";
+  const n = String(number).replace(/'/g, "''");
+  const r = await api("GET", encodeURI(`companies(${company.id})/${ent}?$filter=number eq '${n}'&$select=number`));
+  return r.ok && (r.json?.value?.length > 0);
+}
+
+export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false } = {}) {
+  const res = await verifyOrder(order);
+  if (res.disposition === "review") {
+    return { ok: false, stage: "verify", disposition: res.disposition, dispositionReason: res.dispositionReason };
+  }
+  const company = await resolveCompany();
+  const doc = buildDoc(order, res);
+  const duplicates = await findDuplicates(company, res.rule1.match?.number, order.po_number);
+  const preview = { docType: doc.docType, company: company.name, header: doc.header, lines: doc.lines, duplicates };
+
+  if (!doCreate) return { ok: true, dryRun: true, ...preview };
+
+  if (!targetCompany || targetCompany.toLowerCase() !== company.name.toLowerCase()) {
+    return { ok: false, stage: "guard", reason: `company mismatch — pass "${company.name}" to confirm the write target`, ...preview };
+  }
+  if (duplicates.length && !allowDuplicate) {
+    return { ok: false, stage: "duplicate", reason: `PO "${order.po_number}" already exists in BC`, ...preview };
+  }
+  const hdr = await api("POST", `companies(${company.id})/${doc.ent}`, doc.header);
+  if (!hdr.ok) return { ok: false, stage: "post-header", reason: `header POST HTTP ${hdr.status}: ${(hdr.text || "").slice(0, 300)}`, ...preview };
+  const docId = hdr.json?.id, number = hdr.json?.number;
+  const lineResults = [];
+  for (const line of doc.lines) {
+    const lr = await api("POST", `companies(${company.id})/${doc.ent}(${docId})/${doc.lineEnt}`, line);
+    lineResults.push({ item: line.lineObjectNumber, quantity: line.quantity, ok: lr.ok, status: lr.status });
+  }
+  return { ok: true, created: true, docType: doc.docType, number, id: docId, company: company.name, duplicates, lineResults };
+}
+
 async function run({ orderPath, doCreate, targetCompany, allowDuplicate }) {
   const order = unwrap(JSON.parse(readFileSync(orderPath, "utf8")));
   const res = await verifyOrder(order);

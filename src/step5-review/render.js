@@ -89,16 +89,13 @@ function attachBlock(r) {
 // The action row differs by disposition; buttons are a mock (no handlers).
 function actions(disp) {
   if (disp === "order")
-    return `<button class="btn primary">Approve &amp; create Order</button>
-        <button class="btn">Assign to me</button>
-        <button class="btn ghost">Open original email</button>`;
+    return `<button class="btn primary" data-act="approve">Approve &amp; create Order</button>
+        <button class="btn">Assign to me</button>`;
   if (disp === "quote")
-    return `<button class="btn primary quote">Approve &amp; create Quote</button>
-        <button class="btn">Assign to me</button>
-        <button class="btn ghost">Open original email</button>`;
+    return `<button class="btn primary quote" data-act="approve">Approve &amp; create Quote</button>
+        <button class="btn">Assign to me</button>`;
   return `<button class="btn" disabled>Resolve to continue</button>
-        <button class="btn">Assign to me</button>
-        <button class="btn ghost">Open original email</button>`;
+        <button class="btn">Assign to me</button>`;
 }
 
 export function card(r) {
@@ -122,7 +119,7 @@ export function card(r) {
     ? (r.lines || []).map(lineRow).join("")
     : `<div class="check"><span class="dot bad">!</span><div class="txt"><span class="k">No line items extracted</span><div class="sub">Order body/attachment produced no lines — needs a rep.</div></div></div>`;
 
-  return `<details class="card ${cls}">
+  return `<details class="card ${cls}" data-cid="${esc(r.conversationId || r.id)}">
     <summary class="row">
       ${badge}
       <div class="main">
@@ -149,12 +146,14 @@ export function card(r) {
       <div class="actions">
         ${actions(r.disposition)}
       </div>
+      <div class="result" hidden></div>
     </div>
   </details>`;
 }
 
-export function page(data) {
+export function page(data, opts = {}) {
   const records = data.records || [];
+  const interactive = !!opts.interactive; // served by the live server: wire the buttons
   const tally = data.tally || records.reduce((t, r) => ((t[r.disposition] = (t[r.disposition] || 0) + 1), t), {});
   const when = data.generated ? new Date(data.generated).toLocaleString("en-US") : new Date().toLocaleString("en-US");
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -214,9 +213,16 @@ export function page(data) {
   .pdfs{display:flex;gap:8px;flex-wrap:wrap}
   .pdf-link{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:8px;padding:5px 10px;font-size:12.5px;text-decoration:none;color:var(--accent);background:var(--panel)}
   .pdf-link:hover{border-color:var(--accent)}
+  .result{margin-top:10px;font-size:13px;padding:9px 12px;border-radius:8px;background:var(--chip)}
+  .confirm-box{display:flex;flex-direction:column;gap:8px}
+  .cbtns{display:flex;gap:8px;margin-top:2px}
+  .card.done{opacity:.6}.card.done .badge{filter:grayscale(1)}
+  .refresh{margin-left:auto;font:inherit;font-size:13px;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:6px 13px;cursor:pointer}
+  .refresh:hover{border-color:var(--accent)} .topbar{display:flex;align-items:center;gap:10px;margin-top:8px}
   code{background:var(--chip);padding:1px 5px;border-radius:5px;font-size:12.5px}</style></head><body><div class="wrap">
 <header><h1>Order Review Queue</h1>
-<p>Prototype · orders read from the <code>orders@</code> mailbox, extracted, and checked against Business Central. ${records.length} order(s) · generated ${esc(when)}.</p></header>
+<p>${interactive ? "Live" : "Prototype"} · orders read from the <code>orders@</code> mailbox, extracted, and checked against Business Central. ${records.length} order(s) · generated ${esc(when)}.</p></header>
+${interactive ? '<div class="topbar"><button class="refresh" onclick="refreshQueue()">↻ Check for new mail</button><span id="rmsg" class="sub"></span></div>' : ""}
 <div class="banner"><b>Human-in-the-loop.</b><span>Nothing is written to BC without a rep's approval. Clean orders route to an <b>Order</b> (all in stock) or a <b>Quote</b> (some short); the rest need review. "Approve" here is a mock.</span></div>
 <div class="stats">
   <div class="stat ok"><div class="n">${tally.order || 0}</div><div class="l">→ Create as Order</div></div>
@@ -224,8 +230,53 @@ export function page(data) {
   <div class="stat warn"><div class="n">${tally.review || 0}</div><div class="l">Needs review</div></div>
 </div>
 ${records.map(card).join("\n")}
-</div></body></html>`;
+</div>
+${interactive ? CLIENT_SCRIPT : ""}
+</body></html>`;
 }
+
+// Client-side wiring for the served (interactive) page. Approve is two-step:
+// dry-run preview -> INLINE confirm panel -> real create. (No window.confirm — some
+// embedded browsers auto-dismiss it, which silently cancelled the write.) Refresh
+// re-runs the pipeline.
+const CLIENT_SCRIPT = `<script>
+async function post(url, body){ const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); return r.json(); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+async function refreshQueue(){ const m=document.getElementById('rmsg'); m.textContent=' checking…';
+  try{ const r=await post('/api/refresh'); m.textContent=' '+(r.message||'done')+' — reloading…'; setTimeout(()=>location.reload(),700);}catch(e){ m.textContent=' refresh failed'; } }
+document.addEventListener('click', async (e)=>{
+  const approve = e.target.closest('[data-act="approve"]');
+  const confirmBtn = e.target.closest('[data-act="confirm-create"]');
+  const cancelBtn = e.target.closest('[data-act="cancel-create"]');
+
+  if(approve){
+    const card = approve.closest('details[data-cid]'); const res = card.querySelector('.result');
+    res.hidden=false; res.textContent='Building preview…';
+    const pv = await post('/api/preview',{conversationId:card.dataset.cid});
+    if(!pv.ok){ res.textContent='Cannot create: '+(pv.dispositionReason||pv.reason||'unknown'); return; }
+    const hasDup = !!(pv.duplicates && pv.duplicates.length);
+    const dupHtml = hasDup ? '<div class="dupe">⚠ Already in BC: '+pv.duplicates.map(d=>esc(d.ent)+' '+esc(d.number)).join(', ')+'</div>' : '';
+    res.innerHTML = '<div class="confirm-box"><div><b>Review before creating</b></div>'
+      + '<div class="sub">Create <b>'+esc(pv.docType.toUpperCase())+'</b> in '+esc(pv.company)+' · customer '+esc(pv.header.customerNumber)
+      + ' · PO '+esc(pv.header.externalDocumentNumber||'-')+' · '+pv.lines.length+' line(s)</div>'
+      + dupHtml
+      + '<div class="cbtns"><button class="btn primary" data-act="confirm-create" data-dup="'+hasDup+'">Confirm — write to BC</button>'
+      + '<button class="btn" data-act="cancel-create">Cancel</button></div></div>';
+    return;
+  }
+  if(cancelBtn){ cancelBtn.closest('.result').textContent='Cancelled — nothing written.'; return; }
+  if(confirmBtn){
+    const card = confirmBtn.closest('details[data-cid]'); const res = card.querySelector('.result');
+    res.innerHTML='Creating in BC…';
+    const out = await post('/api/approve',{conversationId:card.dataset.cid, allowDuplicate: confirmBtn.dataset.dup==='true'});
+    if(out.ok && out.created){
+      res.innerHTML='✅ Created '+esc(out.docType)+' <b>'+esc(out.number)+'</b> in '+esc(out.company)+' (open, not released). You can close this.';
+      card.classList.add('done'); const a=card.querySelector('[data-act="approve"]'); if(a) a.disabled=true;
+    } else { res.textContent='Not created: '+(out.reason||'unknown'); }
+    return;
+  }
+});
+</script>`;
 
 function main() {
   const args = process.argv.slice(2);
