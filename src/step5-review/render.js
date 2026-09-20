@@ -110,14 +110,17 @@ export function card(r) {
   const custMark = r.rule1?.pass ? "✓" : "✕";
   const custKey = r.rule1?.pass ? "Matched" : "Not matched with high certainty";
 
-  // Customer fix-up UI, shown whenever the customer didn't resolve: ranked
-  // suggestions (if any) + a live BC customer search + "new customer".
-  const needCustomer = r.rule1 && !r.rule1.pass;
-  const customerFix = needCustomer
-    ? `<div class="sec">Assign customer (pick a suggestion or search)</div>
-    ${r.rule1.suggestions?.length ? `<div class="suggs">${r.rule1.suggestions.map(suggestionBtn).join("")}</div>` : ""}
+  // Customer fix-up UI (ranked suggestions + live BC search + "new customer").
+  // Shown open when the customer didn't resolve; hidden behind a "change" link on a
+  // matched card so a WRONG auto-match can be corrected too. Every pick teaches the
+  // alias, so the same customer resolves itself next time.
+  const fixInner = `${r.rule1?.suggestions?.length ? `<div class="suggs">${r.rule1.suggestions.map(suggestionBtn).join("")}</div>` : ""}
     <div class="custsearch"><input class="csi" type="text" placeholder="search BC customers by name…" autocomplete="off"><div class="csresults suggs"></div></div>
-    <button class="sugg new" data-act="new-customer">＋ This is a new customer</button>`
+    <button class="sugg new" data-act="new-customer">＋ This is a new customer</button>`;
+  const customerFix = r.rule1
+    ? `<div class="custfix"${matched ? " hidden" : ""}>
+      <div class="sec">${matched ? "Reassign to a different customer" : "Assign customer (pick a suggestion or search)"}</div>
+      ${fixInner}</div>`
     : "";
 
   const lineRows = lineCount
@@ -143,7 +146,7 @@ export function card(r) {
       <div class="check">
         <span class="dot ${custDot}">${custMark}</span>
         <div class="txt"><span class="k">${custKey}</span>
-          <div class="sub">${esc(r.rule1?.detail || "")}</div></div>
+          <div class="sub">${esc(r.rule1?.detail || "")}${matched ? ` <button class="changelink" data-act="change-customer">change</button>` : ""}</div></div>
       </div>
       ${customerFix}
       <div class="sec">Line items — part match &amp; stock</div>
@@ -198,6 +201,7 @@ export function page(data, opts = {}) {
   .csi{width:100%;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);font:inherit;font-size:13px}
   .csi:focus{outline:none;border-color:var(--accent)}
   .csresults{margin-top:6px}.csresults:empty{margin:0}
+  .changelink{border:none;background:none;color:var(--accent);cursor:pointer;font:inherit;font-size:12px;padding:0 0 0 6px;text-decoration:underline}
   .main{flex:1;min-width:0}.po{font-weight:650}
   .cust{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .meta{color:var(--muted);font-size:12px;text-align:right;white-space:nowrap}
@@ -259,6 +263,9 @@ document.addEventListener('click', async (e)=>{
   const cancelBtn = e.target.closest('[data-act="cancel-create"]');
   const assign = e.target.closest('[data-act="assign"]');
   const newCust = e.target.closest('[data-act="new-customer"]');
+  const change = e.target.closest('[data-act="change-customer"]');
+
+  if(change){ const p = change.closest('details[data-cid]').querySelector('.custfix'); if(p){ p.hidden=!p.hidden; if(!p.hidden){ const i=p.querySelector('.csi'); if(i) i.focus(); } } return; }
 
   if(assign){
     const card = assign.closest('details[data-cid]'); const res = card.querySelector('.result');

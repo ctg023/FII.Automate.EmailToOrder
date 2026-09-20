@@ -19,6 +19,7 @@ import { resolve, normalize, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { createDoc } from "../step6-order-creation/create.js";
 import { verifyOrder, searchCustomers } from "../step4-bc-verification/verify.js";
+import { setAlias } from "./aliases.js";
 import { page } from "./render.js";
 
 const PORT = Number(process.env.REVIEW_PORT || 8787);
@@ -99,6 +100,8 @@ async function handle(req, res) {
       r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
       r.customer_assigned = { number: customerNumber, name: customerName };
       saveStore(store);
+      // Learn from the pick: future emails from this customer (domain/name) auto-resolve.
+      setAlias({ email: r.customer?.contact_email, name: r.customer?.name, number: customerNumber, customerName });
       return json(res, 200, { ok: true, disposition: res2.disposition, dispositionReason: res2.dispositionReason });
     } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
   }

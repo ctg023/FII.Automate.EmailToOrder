@@ -35,6 +35,7 @@ import { makeClient, extractOne, countOne } from "../step2-extraction/extract.js
 import { classifyOne } from "../step3-classification/classify.js";
 import { verifyOrder } from "../step4-bc-verification/verify.js";
 import { findDuplicates, resolveCompany, docExists } from "../step6-order-creation/create.js";
+import { lookupAlias } from "./aliases.js";
 import { page } from "./render.js";
 
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
@@ -118,6 +119,20 @@ function threadSample(thread, pdfs = []) {
 // The chain, shaped for render.js's conversation block.
 const conversationOf = (thread) =>
   thread.messages.map((m) => ({ direction: m.direction, from: m.from, received: m.received, subject: m.subject, body_text: m.body_text }));
+
+// Verify an order, honoring (1) an existing rep assignment, else (2) a learned alias
+// (email domain / name), else (3) normal name-matching. Returns the verify result and
+// the customer assignment to persist (so preview/approve force the same customer).
+async function verifyWithAlias(order, existing) {
+  if (existing?.number) {
+    return { res: await verifyOrder(order, { forceCustomer: { number: existing.number, displayName: existing.name } }), assigned: existing };
+  }
+  const a = lookupAlias({ email: order.customer?.contact_email, name: order.customer?.name });
+  if (a) {
+    return { res: await verifyOrder(order, { forceCustomer: { number: a.number, displayName: a.name, via: a.via } }), assigned: { number: a.number, name: a.name } };
+  }
+  return { res: await verifyOrder(order), assigned: null };
+}
 
 // Assemble the review record the renderer expects from an extracted order + verify result.
 function toRecord(thread, order, res, classification) {
@@ -209,13 +224,14 @@ async function cmdRun(limit) {
       console.log(`  – not_order  ${t.subject?.slice(0, 50)}`);
       continue;
     }
-    // order or unsure -> extract + verify
-    let order, res;
+    // order or unsure -> extract + verify (alias-aware)
+    let order, res, assigned;
     try { order = (await extractOne(client, sample, { model: MODEL })).parsed_output; }
     catch (e) { console.log(`  ! ${t.subject?.slice(0, 40)} — extract failed: ${e.message}`); continue; }
-    try { res = await verifyOrder(order); }
+    try { ({ res, assigned } = await verifyWithAlias(order)); }
     catch (e) { console.log(`  ! ${t.subject?.slice(0, 40)} — verify failed: ${e.message}`); continue; }
     const record = toRecord(t, order, res, classification);
+    if (assigned) record.customer_assigned = { number: assigned.number, name: assigned.name };
     if (res.disposition === "order" || res.disposition === "quote") await enrichRecord(record, pdfs);
     store.threads[t.conversationId] = { message_ids: t.message_ids, classification, disposition: res.disposition, record };
     const dupNote = record.duplicates?.length ? " ⚠dup-in-BC" : "";
@@ -279,10 +295,11 @@ async function cmdReverify() {
     const r = x.record;
     const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items };
     try {
-      const res = await verifyOrder(order);
+      const { res, assigned } = await verifyWithAlias(order, r.customer_assigned);
       const was = x.disposition;
       r.rule1 = res.rule1; r.lines = res.lines; r.linesPass = res.linesPass;
       r.disposition = res.disposition; r.dispositionReason = res.dispositionReason; x.disposition = res.disposition;
+      if (assigned) r.customer_assigned = { number: assigned.number, name: assigned.name };
       console.log(`  ${was === res.disposition ? " " : "→"} ${res.disposition.padEnd(6)} PO ${r.po_number} · ${r.customer?.name || ""}${was !== res.disposition ? `  (was ${was})` : ""}`);
     } catch (e) { console.log(`  ! ${r.po_number}: ${e.message}`); }
   }

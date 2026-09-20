@@ -26,6 +26,9 @@ Thumbs.db
 tmp/
 out/
 
+# --- Learned customer aliases (built from rep picks; contains customer names/numbers) ---
+data/
+
 # --- Live mailbox ingestion: local processed-state + pulled emails (contain PII) ---
 src/ingestion/.ingest-state.json
 .inbox/

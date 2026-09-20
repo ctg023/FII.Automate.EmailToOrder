@@ -367,7 +367,7 @@ export async function verifyOrder(order, opts = {}) {
     r1 = {
       rule: "1 customer", pass: true,
       match: { number: opts.forceCustomer.number, displayName: opts.forceCustomer.displayName || opts.forceCustomer.number },
-      detail: `manually assigned to ${opts.forceCustomer.number}${opts.forceCustomer.displayName ? ` (${opts.forceCustomer.displayName})` : ""}`,
+      detail: `assigned to ${opts.forceCustomer.number}${opts.forceCustomer.displayName ? ` (${opts.forceCustomer.displayName})` : ""}${opts.forceCustomer.via ? ` [${opts.forceCustomer.via}]` : ""}`,
     };
   } else {
     // No $top — in BC OData, $top hard-caps the total AND suppresses @odata.nextLink,
@@ -527,4 +527,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   main().catch((e) => { console.error(e.message || e); process.exit(1); });
 }
 
-export { normPart, resolveItem, buildItemIndex };
+export { normPart, resolveItem, buildItemIndex, normName };
