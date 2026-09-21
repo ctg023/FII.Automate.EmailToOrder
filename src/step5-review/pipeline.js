@@ -153,6 +153,7 @@ function toRecord(thread, order, res, classification) {
     id: thread.conversationId, conversationId: thread.conversationId,
     po_number: order.po_number, order_date: order.order_date, requested_ship_date: order.requested_ship_date,
     customer: order.customer, ship_to: order.ship_to, line_items: order.line_items,
+    special_instructions: order.notes || null, // PO/email special instructions (surfaced on the card)
     company: res.company, rule1: res.rule1, lines: res.lines, linesPass: res.linesPass,
     shipTo: res.shipTo, contact: res.contact,
     disposition: res.disposition, dispositionReason: res.dispositionReason,

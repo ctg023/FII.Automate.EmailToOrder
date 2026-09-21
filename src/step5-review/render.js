@@ -58,6 +58,27 @@ function lineRow(l) {
       </div></div>`;
 }
 
+// Earliest message date in a record's conversation — the "1st email date", used as
+// the requested/ship-date fallback when the PO states none. ISO string or "".
+export function firstEmailDate(r) {
+  const ds = (r.conversation || []).map((m) => m.received).filter(Boolean).sort();
+  return ds[0] || r.last_received || "";
+}
+
+// Order details: dates (order date, requested/ship — with the 1st-email fallback shown
+// when the PO gave none) and any special instructions (highlighted so a rep can't miss).
+function orderDetailsBlock(r) {
+  const req = r.requested_ship_date && String(r.requested_ship_date).trim();
+  const fb = !req ? firstEmailDate(r) : "";
+  const reqShown = req || (fb ? fb.slice(0, 10) : "");
+  const reqNote = req ? "" : (fb ? ` <span style="color:var(--muted)">(from 1st email — none on PO)</span>` : "");
+  const si = r.special_instructions && String(r.special_instructions).trim();
+  if (!r.order_date && !reqShown && !si) return "";
+  return `<div class="sec">Order details</div>
+    <div class="disporeason">Order date: <b>${esc(r.order_date || "—")}</b> · Requested/ship: <b>${esc(reqShown || "—")}</b>${reqNote}</div>
+    ${si ? `<div class="dupe">✎ Special instructions: ${esc(si)}</div>` : ""}`;
+}
+
 // The email chain for a thread (live pipeline only): inbound customer mail +
 // outbound rep replies, oldest first, so the rep sees the whole negotiation.
 function conversationBlock(r) {
@@ -152,6 +173,7 @@ export function card(r) {
     </summary>
     <div class="detail">
       <div class="disporeason">${esc(r.dispositionReason || "")}</div>
+      ${orderDetailsBlock(r)}
       ${dupBlock(r)}
       ${attachBlock(r)}
       ${conversationBlock(r)}
