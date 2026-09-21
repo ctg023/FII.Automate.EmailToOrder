@@ -47,16 +47,18 @@ function suggestionBtn(s) {
 // in stock, AND no blocking quantity/UoM problem. A resolved+in-stock line whose
 // quantity isn't safe to create (not a multiple of 100, or a multiplier UoM) shows ✕.
 function lineRow(l) {
-  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag && !l.platingFlag;
+  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag && !l.platingFlag && !l.blockedFlag;
   const state = ok ? "ok" : "bad";
   const mark = ok ? "✓" : l.rule2 ? "✕" : "!";
   const priceNote = l.priceNote ? `<div class="sub">${l.priceFlag ? "⚠ " : ""}${esc(l.priceNote)}</div>` : "";
+  const blockedNote = l.blockedFlag ? `<div class="sub" style="color:var(--bad);font-weight:600">⛔ Item ${esc(l.item || "")} is BLOCKED in BC — this line is excluded from the created doc.</div>` : "";
   return `<div class="check">
       <span class="dot ${state}">${mark}</span>
       <div class="txt">
         <span class="k">${esc(l.label)}</span>
         <div class="sub">${esc(l.detail)}</div>
         ${priceNote}
+        ${blockedNote}
       </div></div>`;
 }
 
@@ -91,6 +93,19 @@ function conversationBlock(r) {
     <div class="thread">${rows}</div>`;
 }
 
+// High-value second-approval requirement and/or blocked-line exclusions — surfaced at
+// the top of the card so a rep sees the hold before doing anything. The sign-off itself
+// is collected in the Approve confirm panel (driven by the live preview response).
+function holdBlock(r) {
+  const bits = [];
+  if (r.requiresApproval && r.approvalReason) bits.push(`⚠ ${esc(r.approvalReason)}`);
+  if (r.blockedLines?.length) {
+    const items = r.blockedLines.map((b) => esc(b.item)).join(", ");
+    bits.push(`⛔ ${r.blockedLines.length} line(s) blocked in BC (${items}) — excluded from the created doc; the rest can still be created.`);
+  }
+  return bits.length ? `<div class="dupe">${bits.join("<br>")}</div>` : "";
+}
+
 // Warn when this PO already exists in BC (duplicate guard) so a rep doesn't re-key it.
 function dupBlock(r) {
   if (!r.duplicates?.length) return "";
@@ -101,7 +116,7 @@ function dupBlock(r) {
 // Links to the saved source PDF(s) so a rep can open the original document.
 function attachBlock(r) {
   if (!r.attachments_saved?.length) return "";
-  const links = r.attachments_saved.map((a) => `<a class="pdf-link" href="${esc(a.href)}" target="_blank" rel="noopener">📎 ${esc(a.name || "PDF")}</a>`).join(" ");
+  const links = r.attachments_saved.map((a) => `<a class="pdf-link" data-act="open-pdf" data-path="${esc(a.href)}" href="${esc(a.href)}" target="_blank" rel="noopener">📎 ${esc(a.name || "PDF")}</a>`).join(" ");
   return `<div class="sec">Source document</div><div class="pdfs">${links}</div>`;
 }
 
@@ -128,7 +143,11 @@ function actions(disp) {
 }
 
 export function card(r) {
-  const [badge, cls] = BADGE[r.disposition] || BADGE.review;
+  let [badge, cls] = BADGE[r.disposition] || BADGE.review;
+  // A creatable (order/quote) PO that needs a second sign-off reads as a review state.
+  if (r.requiresApproval && r.disposition !== "review") {
+    badge = '<span class="badge warn">REVIEW · 2ND SIGN-OFF</span>'; cls = "review";
+  }
   const custName = r.customer?.name || "—";
   const matched = r.rule1?.pass && r.rule1?.match;
   const custLine = matched
@@ -168,6 +187,7 @@ export function card(r) {
     </summary>
     <div class="detail">
       <div class="disporeason">${esc(r.dispositionReason || "")}</div>
+      ${holdBlock(r)}
       ${orderDetailsBlock(r)}
       ${dupBlock(r)}
       ${attachBlock(r)}
@@ -289,6 +309,18 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','
 async function refreshQueue(){ const m=document.getElementById('rmsg'); m.textContent=' checking…';
   try{ const r=await post('/api/refresh'); m.textContent=' '+(r.message||'done')+' — reloading…'; setTimeout(()=>location.reload(),700);}catch(e){ m.textContent=' refresh failed'; } }
 document.addEventListener('click', async (e)=>{
+  const openPdf = e.target.closest('[data-act="open-pdf"]');
+  if(openPdf){
+    e.preventDefault();
+    const card = openPdf.closest('details[data-cid]'); const res = card ? card.querySelector('.result') : null;
+    const name = openPdf.textContent.replace(/^[^A-Za-z0-9]*/,'').trim() || 'PDF';
+    if(res){ res.hidden=false; res.textContent='Opening '+name+' in your default PDF viewer…'; }
+    try{ const r = await post('/api/open-pdf',{path:openPdf.dataset.path});
+      if(r.ok){ if(res) res.textContent='Opened '+name+' in your default PDF viewer.'; }
+      else if(res){ res.textContent='Could not open PDF: '+(r.reason||'unknown'); }
+    }catch(err){ if(res) res.textContent='Could not open PDF.'; }
+    return;
+  }
   const approve = e.target.closest('[data-act="approve"]');
   const confirmBtn = e.target.closest('[data-act="confirm-create"]');
   const cancelBtn = e.target.closest('[data-act="cancel-create"]');
@@ -319,19 +351,28 @@ document.addEventListener('click', async (e)=>{
     if(!pv.ok){ res.textContent='Cannot create: '+(pv.dispositionReason||pv.reason||'unknown'); return; }
     const hasDup = !!(pv.duplicates && pv.duplicates.length);
     const dupHtml = hasDup ? '<div class="dupe">⚠ Already in BC: '+pv.duplicates.map(d=>esc(d.ent)+' '+esc(d.number)).join(', ')+'</div>' : '';
+    const blockedHtml = (pv.blockedLines && pv.blockedLines.length) ? '<div class="dupe">⛔ '+pv.blockedLines.length+' blocked line(s) excluded: '+pv.blockedLines.map(b=>esc(b.item)).join(', ')+'</div>' : '';
+    const needAppr = !!pv.requiresApproval;
+    const apprHtml = needAppr
+      ? '<div class="sub" style="color:var(--warn);font-weight:600">⚠ '+esc(pv.approvalReason||'A second approver must sign off before creating.')+'</div>'
+        + '<input class="approver" type="text" placeholder="Second approver — name or initials" autocomplete="off" style="width:100%;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);font:inherit;font-size:13px">'
+      : '';
     res.innerHTML = '<div class="confirm-box"><div><b>Review before creating</b></div>'
       + '<div class="sub">Create <b>'+esc(pv.docType.toUpperCase())+'</b> in '+esc(pv.company)+' · customer '+esc(pv.header.customerNumber)
-      + ' · PO '+esc(pv.header.externalDocumentNumber||'-')+' · '+pv.lines.length+' line(s)</div>'
-      + dupHtml
-      + '<div class="cbtns"><button class="btn primary" data-act="confirm-create" data-dup="'+hasDup+'">Confirm — write to BC</button>'
+      + ' · PO '+esc(pv.header.externalDocumentNumber||'-')+' · '+pv.lines.length+' line(s) to create</div>'
+      + dupHtml + blockedHtml + apprHtml
+      + '<div class="cbtns"><button class="btn primary" data-act="confirm-create" data-dup="'+hasDup+'" data-need-appr="'+needAppr+'"'+(needAppr?' disabled':'')+'>Confirm — write to BC</button>'
       + '<button class="btn" data-act="cancel-create">Cancel</button></div></div>';
     return;
   }
   if(cancelBtn){ cancelBtn.closest('.result').textContent='Cancelled — nothing written.'; return; }
   if(confirmBtn){
     const card = confirmBtn.closest('details[data-cid]'); const res = card.querySelector('.result');
+    const apprInput = res.querySelector('.approver');
+    const approver = apprInput ? apprInput.value.trim() : '';
+    if(confirmBtn.dataset.needAppr==='true' && !approver){ return; } // guarded — button is disabled until filled
     res.innerHTML='Creating in BC…';
-    const out = await post('/api/approve',{conversationId:card.dataset.cid, allowDuplicate: confirmBtn.dataset.dup==='true'});
+    const out = await post('/api/approve',{conversationId:card.dataset.cid, allowDuplicate: confirmBtn.dataset.dup==='true', approver: approver||undefined});
     if(out.ok && out.created){
       const num = out.url ? '<a href="'+out.url+'" target="_blank" rel="noopener"><b>'+esc(out.number)+'</b></a>' : '<b>'+esc(out.number)+'</b>';
       res.innerHTML='✅ Created '+esc(out.docType)+' '+num+' in '+esc(out.company)+' (open, not released). You can close this.';
@@ -342,6 +383,8 @@ document.addEventListener('click', async (e)=>{
 });
 let csTimer;
 document.addEventListener('input', (e)=>{
+  const appr = e.target.closest('.approver');
+  if(appr){ const box=appr.closest('.confirm-box'); const btn=box&&box.querySelector('[data-act="confirm-create"]'); if(btn) btn.disabled = appr.value.trim().length===0; return; }
   const inp = e.target.closest('.csi'); if(!inp) return;
   const box = inp.closest('.custsearch').querySelector('.csresults');
   const q = inp.value.trim();

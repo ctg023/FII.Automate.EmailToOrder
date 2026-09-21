@@ -32,6 +32,15 @@ const ODBASE = BASE.replace(/\/api\/v2\.0$/i, "/ODataV4");
 // emails today, so gating on it reviews nearly every order. Flip on once BC is populated.
 const CONTACT_GATE = process.env.CONTACT_GATE === "1";
 
+// High-value review gate. A PO whose total is at/over this dollar amount requires a
+// SECOND, independent sign-off before it can be created (enforced at create time — see
+// create.js/server.js). Configurable; default $5,000.
+const REVIEW_OVER = Number(process.env.REVIEW_OVER || 5000);
+// Treat a PO we can't total (any line missing a usable price) as needing that same
+// second sign-off — we can't confirm it is under the threshold. On by default; set
+// REVIEW_NO_PRICE=0 to disable (e.g. if most POs price only on the referenced quote).
+const REVIEW_NO_PRICE = process.env.REVIEW_NO_PRICE !== "0";
+
 async function get(pathOrUrl) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${BASE}/${pathOrUrl}`;
   const res = await fetch(url, { headers: { Authorization: AUTH, Accept: "application/json" } });
@@ -339,6 +348,22 @@ const QTY_STEP = Number(process.env.QTY_STEP || 100);
 const qtyNeedsReview = (qty, uomFlag) =>
   !uomFlag && QTY_STEP > 1 && Number.isFinite(qty) && qty > 0 && qty % QTY_STEP !== 0;
 
+// PO total for the high-value gate: Σ(quantity × unit_price) across lines. Returns
+// { total, priced }. priced=false when ANY line is missing a usable price/qty — then
+// the total is UNKNOWN and (if REVIEW_NO_PRICE) the order routes to a second sign-off,
+// because we can't prove it is under the threshold.
+function orderTotal(order) {
+  const items = order.line_items || [];
+  let total = 0, priced = true;
+  for (const li of items) {
+    const q = Number(li?.quantity), p = Number(li?.unit_price);
+    if (!Number.isFinite(q) || !Number.isFinite(p)) { priced = false; continue; }
+    total += q * p;
+  }
+  return { total, priced };
+}
+const usd = (n) => `$${Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
 // --- Plating substitution ----------------------------------------------------
 // Customers often order the BASE item number and ask (in the line text / notes) for a
 // finish; the plated finish is a DIFFERENT item, base + "-P##" (e.g. SSM 05014 ->
@@ -464,9 +489,15 @@ async function checkLine(company, line, custNo, notes) {
     }
   }
 
+  // Blocked-item check: BC's item "Blocked" flag. A blocked item can't be sold, so the
+  // line is EXCLUDED from the created doc (create.js drops it) and the order is flagged
+  // for a human — the rest of the PO can still be created without it.
+  const blockedFlag = item.blocked === true;
+  const blockedText = blockedFlag ? ` [⛔ item ${item.number} is BLOCKED in BC — this line is excluded from the created doc]` : "";
+
   // Rule 3 — inventory >= quantity ordered.
   if (qty == null) {
-    return { label, pass: false, rule2: true, item: item.number, detail: `resolved to ${item.number} (via ${via}) but order has no quantity to verify` };
+    return { label, pass: false, rule2: true, item: item.number, blockedFlag, detail: `resolved to ${item.number} (via ${via}) but order has no quantity to verify${blockedText}` };
   }
   const onHand = Number(item.inventory ?? 0);
   const enough = onHand >= qty;
@@ -480,8 +511,8 @@ async function checkLine(company, line, custNo, notes) {
     : "";
   const platingText = platingNote ? ` [${platingFlag ? "⚠ " : ""}${platingNote}]` : "";
   return {
-    label, pass: enough, rule2: true, item: item.number, via, uomFlag, qtyFlag, platingFlag, platingNote, platingCandidates,
-    detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}${platingText}`,
+    label, pass: enough, rule2: true, item: item.number, via, uomFlag, qtyFlag, platingFlag, platingNote, platingCandidates, blockedFlag,
+    detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}${platingText}${blockedText}`,
   };
 }
 
@@ -682,7 +713,24 @@ export async function verifyOrder(order, opts = {}) {
   const qtyIssue = lines.some((l) => l.qtyFlag); // piece qty not a multiple of QTY_STEP (e.g. 2120)
   const platingIssue = lines.some((l) => l.platingFlag); // plating requested but not resolved to one variant
   const priceIssue = priceRes.checked && priceRes.mismatches > 0; // PO price != referenced quote
-  const allInStock = gateParts && lines.every((l) => l.pass);
+  // Blocked items are EXCLUDED from the created doc, so the order/quote decision (and
+  // stock check) considers only the NON-blocked lines. If EVERY line is blocked there is
+  // nothing left to create -> hard review.
+  const blockedLines = lines.filter((l) => l.blockedFlag).map((l) => ({ label: l.label, item: l.item }));
+  const creatableLines = lines.filter((l) => l.rule2 && !l.blockedFlag);
+  const allBlocked = gateParts && blockedLines.length > 0 && creatableLines.length === 0;
+  const allInStock = gateParts && lines.filter((l) => !l.blockedFlag).every((l) => l.pass);
+  // High-value gate: PO total >= REVIEW_OVER (or un-totalable when REVIEW_NO_PRICE) needs
+  // a second, independent sign-off before it can be created (enforced in create.js).
+  const { total: poTotal, priced } = orderTotal(order);
+  const highValue = priced && poTotal >= REVIEW_OVER;
+  const noPrice = REVIEW_NO_PRICE && !priced;
+  const requiresApproval = highValue || noPrice;
+  const approvalReason = highValue
+    ? `PO total ${usd(poTotal)} is at/over ${usd(REVIEW_OVER)} — a second approver must sign off before creating`
+    : noPrice
+      ? `PO has no line prices to total (threshold ${usd(REVIEW_OVER)}) — a second approver must sign off before creating`
+      : null;
   const multiPO = multiplePOs(order.po_number); // one email carrying 2+ POs
   let disposition, dispositionReason;
   if (lines.length === 0) {
@@ -710,6 +758,9 @@ export async function verifyOrder(order, opts = {}) {
   } else if (priceIssue) {
     disposition = "review";
     dispositionReason = `${priceRes.mismatches} line(s) priced differently from the referenced quote (BC/Q ${priceRes.quotes.join(", ")}) — confirm the price before creating`;
+  } else if (allBlocked) {
+    disposition = "review";
+    dispositionReason = `all ${lines.length} line(s) are blocked in BC — nothing left to create`;
   }
   // Customer + parts + UoM all clean → Rules 4 & 5: ship-to and contact.
   // Ship-to is a hard gate. Contact is INFORMATIONAL by default: BC does not store the
@@ -731,7 +782,16 @@ export async function verifyOrder(order, opts = {}) {
       disposition = "quote"; dispositionReason = `customer & ship-to matched; one or more lines short → quote${contactNote}`;
     }
   }
-  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes };
+  // Overlays on a creatable (order/quote) disposition: a high-value sign-off requirement
+  // and/or blocked-line exclusions. These do NOT change the doc type — they add a note
+  // (and, for high-value, a create-time gate that a second sign-off unlocks).
+  if (disposition !== "review") {
+    const holds = [];
+    if (requiresApproval) holds.push(`⚠ ${approvalReason}`);
+    if (blockedLines.length) holds.push(`⚠ ${blockedLines.length} line(s) blocked in BC (${blockedLines.map((b) => b.item).slice(0, 3).join(", ")}) — excluded from the created doc`);
+    if (holds.length) dispositionReason = `${dispositionReason} · ${holds.join(" · ")}`;
+  }
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines };
 }
 
 const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };

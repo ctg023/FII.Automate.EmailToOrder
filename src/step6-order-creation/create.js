@@ -97,11 +97,12 @@ function buildDoc(order, res) {
   if (res.contact?.contact?.name) header.shipToContact = res.contact.contact.name;
   const lines = res.lines
     .map((l, i) => {
+      if (l.blockedFlag) return null; // item blocked in BC — excluded from the created doc
       const ln = { lineType: "Item", lineObjectNumber: l.item, quantity: order.line_items?.[i]?.quantity };
       if (delivery) ln.shipmentDate = delivery; // Shipment Date matches the requested delivery date
       return ln;
     })
-    .filter((l) => l.lineObjectNumber && l.quantity != null);
+    .filter((l) => l && l.lineObjectNumber && l.quantity != null);
   const ent = res.disposition === "order" ? "salesOrders" : "salesQuotes";
   const lineEnt = res.disposition === "order" ? "salesOrderLines" : "salesQuoteLines";
   return { docType: res.disposition, ent, lineEnt, header, lines };
@@ -121,7 +122,7 @@ export async function docExists(company, docType, number) {
   return r.ok && (r.json?.value?.length > 0);
 }
 
-export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false, forceCustomer = null } = {}) {
+export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false, forceCustomer = null, approval = null } = {}) {
   const res = await verifyOrder(order, forceCustomer ? { forceCustomer } : {});
   if (res.disposition === "review") {
     return { ok: false, stage: "verify", disposition: res.disposition, dispositionReason: res.dispositionReason };
@@ -129,12 +130,27 @@ export async function createDoc(order, { doCreate = false, targetCompany = null,
   const company = await resolveCompany();
   const doc = buildDoc(order, res);
   const duplicates = await findDuplicates(company, res.rule1.match?.number, order.po_number);
-  const preview = { docType: doc.docType, company: company.name, header: doc.header, lines: doc.lines, duplicates };
+  // Overlays surfaced to the caller so the review UI can gate the write: a high-value
+  // second-approval requirement, and any blocked lines that were excluded from the doc.
+  const signOff = approval && String(approval).trim() ? String(approval).trim() : null;
+  const preview = {
+    docType: doc.docType, company: company.name, header: doc.header, lines: doc.lines, duplicates,
+    requiresApproval: !!res.requiresApproval, approvalReason: res.approvalReason || null,
+    orderTotal: res.orderTotal ?? null, threshold: res.threshold, blockedLines: res.blockedLines || [],
+  };
 
   if (!doCreate) return { ok: true, dryRun: true, ...preview };
 
   if (!targetCompany || targetCompany.toLowerCase() !== company.name.toLowerCase()) {
     return { ok: false, stage: "guard", reason: `company mismatch — pass "${company.name}" to confirm the write target`, ...preview };
+  }
+  // High-value: refuse to create without a second, independent sign-off.
+  if (res.requiresApproval && !signOff) {
+    return { ok: false, stage: "approval", reason: res.approvalReason || `PO requires a second approver before creating`, ...preview };
+  }
+  // Everything creatable was excluded (e.g. all lines blocked) — nothing to write.
+  if (!doc.lines.length) {
+    return { ok: false, stage: "empty", reason: `no creatable lines — all line(s) excluded (blocked in BC)`, ...preview };
   }
   if (duplicates.length && !allowDuplicate) {
     return { ok: false, stage: "duplicate", reason: `PO "${order.po_number}" already exists in BC`, ...preview };
@@ -147,10 +163,10 @@ export async function createDoc(order, { doCreate = false, targetCompany = null,
     const lr = await api("POST", `companies(${company.id})/${doc.ent}(${docId})/${doc.lineEnt}`, line);
     lineResults.push({ item: line.lineObjectNumber, quantity: line.quantity, ok: lr.ok, status: lr.status });
   }
-  return { ok: true, created: true, docType: doc.docType, number, id: docId, company: company.name, duplicates, lineResults };
+  return { ok: true, created: true, docType: doc.docType, number, id: docId, company: company.name, duplicates, lineResults, approvedBy: signOff, blockedExcluded: res.blockedLines || [] };
 }
 
-async function run({ orderPath, doCreate, targetCompany, allowDuplicate }) {
+async function run({ orderPath, doCreate, targetCompany, allowDuplicate, approver }) {
   const order = unwrap(JSON.parse(readFileSync(orderPath, "utf8")));
   const res = await verifyOrder(order);
 
@@ -159,6 +175,17 @@ async function run({ orderPath, doCreate, targetCompany, allowDuplicate }) {
   if (res.disposition === "review") {
     console.log("  ⛔ Not creatable — needs a human to resolve the customer/parts first.");
     return;
+  }
+  if (res.requiresApproval) {
+    console.log(`  ⚠ SECOND APPROVAL REQUIRED — ${res.approvalReason}`);
+    if (doCreate && !approver) {
+      console.error(`\n  REFUSING TO WRITE: pass --approve "<second approver>" to sign off on this high-value PO.`);
+      process.exit(1);
+    }
+    if (approver) console.log(`  Second approver: ${approver}`);
+  }
+  if (res.blockedLines?.length) {
+    console.log(`  ⚠ ${res.blockedLines.length} line(s) blocked in BC — excluded from the created doc: ${res.blockedLines.map((b) => b.item).join(", ")}`);
   }
 
   const company = await resolveCompany();           // read-only
@@ -222,7 +249,8 @@ function main() {
   const doCreate = args.includes("--create");
   const allowDuplicate = args.includes("--allow-duplicate");
   const targetCompany = args.indexOf("--company") !== -1 ? args[args.indexOf("--company") + 1] : null;
-  return run({ orderPath, doCreate, targetCompany, allowDuplicate });
+  const approver = args.indexOf("--approve") !== -1 ? args[args.indexOf("--approve") + 1] : null;
+  return run({ orderPath, doCreate, targetCompany, allowDuplicate, approver });
 }
 
 // Only run the CLI when executed directly; importing (e.g. findDuplicates from the

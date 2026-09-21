@@ -71,8 +71,37 @@ function servePdf(req, res, urlPath) {
   const rel = decodeURIComponent(urlPath.replace(/^\/pdfs\//, ""));
   const full = normalize(resolve(PDF_ROOT, rel));
   if (!full.startsWith(PDF_ROOT) || !existsSync(full) || !statSync(full).isFile()) { res.writeHead(404); return res.end("not found"); }
-  res.writeHead(200, { "Content-Type": MIME[extname(full).toLowerCase()] || "application/octet-stream" });
-  res.end(readFileSync(full));
+  const buf = readFileSync(full);
+  // `inline` (not `attachment`) tells the browser to render the PDF in its viewer/new
+  // tab rather than prompt a download. Quote the filename so spaces don't break the header.
+  const name = full.split(/[\\/]/).pop().replace(/"/g, "");
+  res.writeHead(200, {
+    "Content-Type": MIME[extname(full).toLowerCase()] || "application/octet-stream",
+    "Content-Disposition": `inline; filename="${name}"`,
+    "Content-Length": buf.length,
+  });
+  res.end(buf);
+}
+
+// Resolve a client-supplied pdfs/ path to a real file UNDER PDF_ROOT (rejects anything
+// outside it), so the open endpoint can't be pointed at an arbitrary file on disk.
+function resolvePdf(relPath) {
+  const rel = decodeURIComponent(String(relPath || "").replace(/^\/?pdfs\//, ""));
+  const full = normalize(resolve(PDF_ROOT, rel));
+  if (!full.startsWith(PDF_ROOT) || !existsSync(full) || !statSync(full).isFile()) return null;
+  return full;
+}
+
+// Launch a file in the machine's default application (Adobe/Edge/etc.). This opens on
+// the HOST running the server — intended for local use (viewer on the same machine).
+// Detached + unref so the viewer's lifetime is independent of the server.
+function openInDefaultApp(fullPath) {
+  const child =
+    process.platform === "win32" ? spawn("cmd", ["/c", "start", "", fullPath], { detached: true, stdio: "ignore" })
+    : process.platform === "darwin" ? spawn("open", [fullPath], { detached: true, stdio: "ignore" })
+    : spawn("xdg-open", [fullPath], { detached: true, stdio: "ignore" });
+  child.unref();
+  return child;
 }
 
 async function handle(req, res) {
@@ -87,6 +116,15 @@ async function handle(req, res) {
     return res.end(page({ generated: store.generated, records, tally }, { interactive: true }));
   }
   if (req.method === "GET" && p.startsWith("/pdfs/")) return servePdf(req, res, p);
+
+  // Open a saved PDF in the host's default PDF viewer (local-use convenience).
+  if (req.method === "POST" && p === "/api/open-pdf") {
+    const { path: relPath } = await readBody(req);
+    const full = resolvePdf(relPath);
+    if (!full) return json(res, 404, { ok: false, reason: "PDF not found" });
+    try { openInDefaultApp(full); return json(res, 200, { ok: true }); }
+    catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
 
   if (req.method === "GET" && p === "/api/search-customers") {
     try { return json(res, 200, { ok: true, results: await searchCustomers(url.searchParams.get("q")) }); }
@@ -126,16 +164,19 @@ async function handle(req, res) {
   }
 
   if (req.method === "POST" && p === "/api/approve") {
-    const { conversationId, allowDuplicate } = await readBody(req);
+    const { conversationId, allowDuplicate, approver } = await readBody(req);
     const store = loadStore();
     const entry = store.threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
     const fc = entry.record.customer_assigned ? { number: entry.record.customer_assigned.number, displayName: entry.record.customer_assigned.name } : null;
     try {
-      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate, forceCustomer: fc });
+      // `approver` = the second, independent sign-off for high-value POs (createDoc
+      // refuses a high-value write without it). Ignored for normal-value POs.
+      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate, forceCustomer: fc, approval: approver });
       if (out.ok && out.created) { // mark actioned so it leaves the open queue
         entry.record.status = "actioned"; entry.record.bc_number = out.number; entry.record.bc_docType = out.docType;
         entry.record.bc_url = bcLink(out.docType, out.number);
+        if (out.approvedBy) entry.record.approved_by = out.approvedBy; // audit: who signed off
         saveStore(store);
         out.url = entry.record.bc_url;
       }
