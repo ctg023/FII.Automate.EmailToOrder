@@ -72,6 +72,18 @@ function buildDoc(order, res) {
   if (isISO(order.order_date)) header[dateField] = order.order_date.slice(0, 10);
   // requestedDeliveryDate exists on salesOrder only — salesQuote 400s on it.
   if (res.disposition === "order" && isISO(order.requested_ship_date)) header.requestedDeliveryDate = order.requested_ship_date.slice(0, 10);
+  // Ship-to + contact from the matched BC records (Rules 4 & 5), so the doc uses the
+  // address/contact on file rather than re-typed values.
+  const s = res.shipTo?.shipTo;
+  if (s) {
+    if (s.Name) header.shipToName = s.Name;
+    if (s.Address) header.shipToAddressLine1 = s.Address;
+    header.shipToAddressLine2 = s.Address_2 || "";
+    if (s.City) header.shipToCity = s.City;
+    if (s.County) header.shipToState = s.County;
+    if (s.Post_Code) header.shipToPostCode = s.Post_Code;
+  }
+  if (res.contact?.contact?.name) header.shipToContact = res.contact.contact.name;
   const lines = res.lines
     .map((l, i) => ({ lineType: "Item", lineObjectNumber: l.item, quantity: order.line_items?.[i]?.quantity }))
     .filter((l) => l.lineObjectNumber && l.quantity != null);

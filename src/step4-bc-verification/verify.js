@@ -28,6 +28,9 @@ const AUTH = "Basic " + Buffer.from(`${USER}:${PASS}`).toString("base64");
 // The standard API v2.0 does not expose item references; the published
 // `Item_References_Excel` page does (a LIVE view of the Item Reference table).
 const ODBASE = BASE.replace(/\/api\/v2\.0$/i, "/ODataV4");
+// Contact/email as a HARD gate (Rule 5). Off by default — BC lacks per-customer buyer
+// emails today, so gating on it reviews nearly every order. Flip on once BC is populated.
+const CONTACT_GATE = process.env.CONTACT_GATE === "1";
 
 async function get(pathOrUrl) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${BASE}/${pathOrUrl}`;
@@ -336,6 +339,59 @@ async function checkLine(company, line, custNo) {
   };
 }
 
+// --- Rules 4 & 5: ship-to and contact validation (against live BC OData) ---
+const normPost = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5);
+const streetNo = (s) => (String(s || "").match(/\d+/) || [""])[0];
+const chunk = (a, n) => { const o = []; for (let i = 0; i < a.length; i += n) o.push(a.slice(i, i + n)); return o; };
+
+// Rule 4 — does the PO ship-to match one of the customer's ship-to addresses on file?
+// Uses the published `ShipTo` OData page. Match = same postal code AND (same city or
+// same street number). Returns the matched row so create can copy its address.
+async function checkShipTo(company, order, custNo) {
+  const st = order?.ship_to || {};
+  const wantPost = normPost(st.postal_code), wantCity = normGeo(st.city), wantNum = streetNo(st.line1);
+  const url = encodeURI(`${ODBASE}/Company(${odataStr(company.name)})/ShipTo?$filter=Customer_No eq ${odataStr(custNo)}&$select=Code,Name,Address,Address_2,City,Post_Code,County,Contact,E_Mail`);
+  const r = await get(url);
+  if (!r.ok) return { pass: false, detail: `ship-to lookup failed (HTTP ${r.status})` };
+  const rows = r.json?.value || [];
+  if (!rows.length) return { pass: false, detail: "customer has no ship-to addresses on file" };
+  for (const row of rows) {
+    const postOK = wantPost && wantPost === normPost(row.Post_Code);
+    const cityOK = wantCity && wantCity === normGeo(row.City);
+    const numOK = wantNum && wantNum === streetNo(row.Address);
+    if ((postOK && (cityOK || numOK)) || (!wantPost && cityOK && numOK)) {
+      return { pass: true, detail: `matched ship-to "${row.Code}" (${row.City || ""} ${row.Post_Code || ""})`, shipTo: row };
+    }
+  }
+  return { pass: false, detail: `PO ship-to (${st.city || "?"} ${st.postal_code || ""}) not among ${rows.length} on file` };
+}
+
+// Rule 5 — is the PO's contact email already associated with the customer? Checks the
+// customer's own email plus every related Contact (via ContactBusinessRelation).
+// Returns the matched contact so create can name it.
+async function checkContact(company, order, custNo) {
+  const email = String(order?.customer?.contact_email || "").toLowerCase().trim();
+  if (!email) return { pass: false, detail: "no contact email on the PO to match" };
+  const emails = new Set();
+  const cr = await get(`companies(${company.id})/customers?$filter=number eq ${odataStr(custNo)}&$select=email`);
+  const custEmail = String(cr.json?.value?.[0]?.email || "").toLowerCase().trim();
+  if (custEmail) emails.add(custEmail);
+  const ODC = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const rel = await get(encodeURI(`${ODC}/ContactBusinessRelation?$filter=No eq ${odataStr(custNo)}&$select=Contact_No,Link_to_Table`));
+  const contactNos = (rel.json?.value || []).filter((x) => /customer/i.test(x.Link_to_Table || "")).map((x) => x.Contact_No).filter(Boolean);
+  let matched = null;
+  for (const grp of chunk(contactNos, 15)) {
+    const f = grp.map((n) => `No eq ${odataStr(n)}`).join(" or ");
+    const cs = await get(encodeURI(`${ODC}/Contact?$filter=${f}&$select=No,Name,E_Mail`));
+    for (const c of cs.json?.value || []) {
+      const e = String(c.E_Mail || "").toLowerCase().trim();
+      if (e) { emails.add(e); if (e === email && !matched) matched = { no: c.No, name: c.Name }; }
+    }
+  }
+  if (emails.has(email)) return { pass: true, detail: matched ? `matched contact ${matched.no} (${matched.name})` : "matched customer email", contact: matched };
+  return { pass: false, detail: `PO contact "${email}" not on file for this customer (${emails.size} known email(s))` };
+}
+
 // Cached full customer list (BC has ~9k; the pull is the slow part). Cached for 10
 // min so verify/preview/approve/search reuse it instead of re-pulling every call.
 let CUST_LIST = null, CUST_LIST_AT = 0;
@@ -403,12 +459,28 @@ export async function verifyOrder(order, opts = {}) {
     disposition = "review";
     const n = lines.filter((l) => l.uomFlag).length;
     dispositionReason = `${n} line(s) use a non-piece unit (e.g. 100PACK / M / C) — a human must confirm the quantity before creating`;
-  } else if (allInStock) {
-    disposition = "order"; dispositionReason = "customer matched; all lines in stock";
-  } else {
-    disposition = "quote"; dispositionReason = "customer matched; one or more lines not in stock → quote";
   }
-  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason };
+  // Customer + parts + UoM all clean → Rules 4 & 5: ship-to and contact.
+  // Ship-to is a hard gate. Contact is INFORMATIONAL by default: BC does not store the
+  // individual buyer emails that appear on POs (customers have one company-contact,
+  // usually with no/placeholder email), so gating on it would reject nearly every order.
+  // Set CONTACT_GATE=1 to make it a hard gate (only sensible once BC contacts are populated).
+  let shipToRes = null, contactRes = null;
+  if (!disposition) {
+    shipToRes = await checkShipTo(company, order, custNo);
+    contactRes = await checkContact(company, order, custNo);
+    const contactNote = contactRes.pass ? "" : " (contact not on file)";
+    if (!shipToRes.pass) {
+      disposition = "review"; dispositionReason = `ship-to not on file — ${shipToRes.detail}`;
+    } else if (CONTACT_GATE && !contactRes.pass) {
+      disposition = "review"; dispositionReason = `contact/email not on file — ${contactRes.detail}`;
+    } else if (allInStock) {
+      disposition = "order"; dispositionReason = `customer & ship-to matched; all lines in stock${contactNote}`;
+    } else {
+      disposition = "quote"; dispositionReason = `customer & ship-to matched; one or more lines short → quote${contactNote}`;
+    }
+  }
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes };
 }
 
 const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };

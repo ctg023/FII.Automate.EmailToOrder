@@ -141,6 +141,7 @@ function toRecord(thread, order, res, classification) {
     po_number: order.po_number, order_date: order.order_date, requested_ship_date: order.requested_ship_date,
     customer: order.customer, ship_to: order.ship_to, line_items: order.line_items,
     company: res.company, rule1: res.rule1, lines: res.lines, linesPass: res.linesPass,
+    shipTo: res.shipTo, contact: res.contact,
     disposition: res.disposition, dispositionReason: res.dispositionReason,
     classification, conversation: conversationOf(thread), last_received: thread.last_received,
   };
@@ -298,6 +299,7 @@ async function cmdReverify() {
       const { res, assigned } = await verifyWithAlias(order, r.customer_assigned);
       const was = x.disposition;
       r.rule1 = res.rule1; r.lines = res.lines; r.linesPass = res.linesPass;
+      r.shipTo = res.shipTo; r.contact = res.contact;
       r.disposition = res.disposition; r.dispositionReason = res.dispositionReason; x.disposition = res.disposition;
       if (assigned) r.customer_assigned = { number: assigned.number, name: assigned.name };
       console.log(`  ${was === res.disposition ? " " : "→"} ${res.disposition.padEnd(6)} PO ${r.po_number} · ${r.customer?.name || ""}${was !== res.disposition ? `  (was ${was})` : ""}`);

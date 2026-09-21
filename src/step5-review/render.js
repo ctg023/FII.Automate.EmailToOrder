@@ -86,6 +86,16 @@ function attachBlock(r) {
   return `<div class="sec">Source document</div><div class="pdfs">${links}</div>`;
 }
 
+// Ship-to and contact validation results (Rules 4 & 5), shown when they were checked.
+function shipContactBlock(r) {
+  if (!r.shipTo && !r.contact) return "";
+  const row = (label, res) => res
+    ? `<div class="check"><span class="dot ${res.pass ? "ok" : "bad"}">${res.pass ? "✓" : "✕"}</span>
+        <div class="txt"><span class="k">${label}</span><div class="sub">${esc(res.detail || "")}</div></div></div>`
+    : "";
+  return `<div class="sec">Ship-to &amp; contact</div>${row("Ship-to", r.shipTo)}${row("Contact / email", r.contact)}`;
+}
+
 // The action row differs by disposition; buttons are a mock (no handlers).
 function actions(disp) {
   if (disp === "order")
@@ -149,6 +159,7 @@ export function card(r) {
           <div class="sub">${esc(r.rule1?.detail || "")}${matched ? ` <button class="changelink" data-act="change-customer">change</button>` : ""}</div></div>
       </div>
       ${customerFix}
+      ${shipContactBlock(r)}
       <div class="sec">Line items — part match &amp; stock</div>
       ${lineRows}
       <div class="actions">
