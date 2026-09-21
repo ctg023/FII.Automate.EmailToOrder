@@ -66,8 +66,12 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     free) · `--reverify` (re-apply rules to cache, no Claude) · `--enrich` (dup-check + save PDFs) · `--reconcile`
     (BC-deleted back to queue + mailbox reconcile) · `--reconcile-mailbox` · `--rerender`. `server.js` serves the app.
 - **Step 6 (order creation):** write **proven** — `src/step6-order-creation/create.js`; `createDoc()` is the
-  programmatic path the server calls. Dry-run default; guarded real write. ⚠️ BC assigns a **default** number
-  series until the `EMAILORDER` No.-Series **AL codeunit is deployed** (developer task — then S-ORD-EMAIL/S-QUO-EMAIL).
+  programmatic path the server calls. Dry-run default; guarded real write. **Dates:** sets **Requested Delivery
+  Date** (header) = the PO's requested date, else **today's order-entry date**, and the **line Shipment Date**
+  = that same date. ⚠️ The standard API salesOrder header exposes **no** `shipmentDate` (or Promised Delivery
+  Date), so the header Shipment Date can't be written — BC leaves it at the work date; only the *line* Shipment
+  Date is set (see Open items). ⚠️ BC assigns a **default** number series until the `EMAILORDER` No.-Series
+  **AL codeunit is deployed** (developer task — then S-ORD-EMAIL/S-QUO-EMAIL).
 - **Ingestion (Track A):** **LIVE** — Entra app + `.env` done; `mailbox.js --check` green; reads
   `order@buckeyefasteners.com` (singular). Handles **forwarded-as-email POs** (e.g. Bunn) — a Graph
   `itemAttachment` (message/rfc822) whose real PDF is nested one level down is pulled via a nested `$expand`
@@ -78,6 +82,15 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   prod) (2) build the **mailbox move-on-approve** cleanup (needs `Mail.ReadWrite`)? (3) server **auth**,
   mailbox **Access Policy fence**, deploy the **EMAILORDER codeunit** — all before pilot. Backlog idea:
   item-level quote history / rate-shopping (see PROJECT-STATUS).
+- **Open date items (discussed, NOT built):** (a) **header Shipment Date** — the API can't write it, so it
+  reads BC's work date, not the requested date; fix options: a post-create **re-validate PATCH** to make BC
+  recalc it (untested), a **classic `Sales_Order_Excel` PATCH**, or a **BC API extension** exposing
+  `shipmentDate` (bundle with the dev handoff). (b) **Two dates (requested + required)** — POs sometimes carry
+  both under varied labels, but extraction captures only **one** (`requested_ship_date`); plan: add a second
+  extracted field + surface it, and write the "required" date to BC (e.g. Promised Delivery Date) once the API
+  extension exists. (c) **Established Ship-To vs Custom Address** — create writes the ship-to *address* fields
+  (shows as "Custom Address") rather than selecting the matched **Ship-to Code**; revisit so it uses the
+  established Ship-To.
 
 ## Stack & architecture
 - **Node.js (ESM)** throughout. No build step; run `.js` directly with `node`.
