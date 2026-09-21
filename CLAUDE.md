@@ -24,10 +24,12 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   `RW2114OHIO`→`RW-2114`; both require a unique BC match) · **3** stock · **4** ship-to matches a `ShipTo` on file
   (hard gate) · **5** contact/email matches a Person contact under the customer's company contact
   (`Contact`/`ContactBusinessRelation`; **informational unless `CONTACT_GATE=1`**) · **6** price matches the
-  **referenced BC quote** — extract the **BC/Q #** from the subject, look up `salesQuotes`(number)→lines, and
-  compare each item's `unitPrice` to the PO's (exact by default; `PRICE_TOL` per-unit $ tolerance); mismatch →
-  review. ⚠️ Many referenced quotes live in **production**, not BC260TEST (its quotes are header-only), so the
-  price check **validates against prod** — in test it reports "quote not in this company" and does not gate.
+  **referenced BC quote** — extract the **BC/Q #** from the subject and read its item unit prices from the
+  **classic OData pages** (`Sales_Quote_Excel`+`…SalesLines` for an open quote; if the rep already converted
+  it, `Sales_Order_Excel` by **`Quote_No`**+`…SalesLines`), then compare each item's price to the PO's (exact
+  by default; `PRICE_TOL` per-unit $ tolerance); mismatch → review. NB: the **standard `salesQuotes` API has no
+  usable No./lines** — use the classic pages. A referenced quote not in the current instance (some live only in
+  **prod**) is reported, not gated.
   Also gates: non-piece **UoM** (100PACK/M/C → review), **piece quantity not a multiple of 100** (fasteners
   ship in hundreds; e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), and **multi-PO-in-one-email** →
   review. `--batch <dir> --json <out>` emits records.

@@ -24,12 +24,15 @@ Live-backlog hardening from working real orders in the review app:
 - **Order dates + special instructions** surfaced on each card; requested/ship date **falls back to the 1st
   email date** when the PO states none (and populates on the created BC order). Line item shows **✕** (not a
   green ✓) when a qty/UoM/price problem blocks creation.
-- **Price match vs referenced quote (Rule 6)** — extract the **BC/Q #** from the subject, look up the BC
-  `salesQuote` and compare each item's `unitPrice` to the PO's (**exact** by default, `PRICE_TOL` to loosen);
-  mismatch → review. Confirmed the field mapping (`salesQuotes.number` = BC/Q #, lines carry `unitPrice`) and
-  validated the logic against quote 228874 (PO NS313502 matched to the 4th decimal). ⚠️ **Prod-validated**:
-  the referenced quotes largely live in production; **BC260TEST quotes are header-only (no lines)**, so in
-  test the check reports "quote not in this company" and does not gate — validate real matches against prod.
+- **Price match vs referenced quote (Rule 6)** — extract the **BC/Q #** from the subject and compare each
+  item's price to the referenced quote (**exact** by default, `PRICE_TOL` to loosen); mismatch → review.
+  **Data source = classic OData pages** (the standard `salesQuotes` API has no usable No./lines): open quote via
+  `Sales_Quote_Excel`(+`SalesLines`); a quote the rep already **converted to an order** via `Sales_Order_Excel`
+  matched on **`Quote_No`**(+`SalesLines`). Validated end-to-end in BC260TEST — open quote 222745 (match +
+  mismatch both correct) and the converted-order linkage (186118 → order 197377). Logic also cross-checks
+  against the real quote 228874 the user provided (PO NS313502 matched to the 4th decimal). The *specific*
+  referenced quotes (228k) aren't in the test restore (prod-only); the check reports "not in this company"
+  and does not gate — so a **prod smoke-test** is the only remaining validation.
 
 ## Where we are
 Working through the brief's build order. **Steps 1–3 done. Step 4 in progress:** BC connectivity

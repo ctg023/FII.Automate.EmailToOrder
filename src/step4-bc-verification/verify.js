@@ -511,21 +511,38 @@ export async function searchCustomers(q, limit = 15) {
 // Prices must match; PRICE_TOL is a per-unit $ tolerance (0 = exact, the default).
 const PRICE_TOL = Number(process.env.PRICE_TOL || 0);
 
-// Item-line unit prices of a BC sales quote, by number (standard API v2.0):
-// our-item-number(normalized) -> { unitPrice, quote }. Charge/freight lines are skipped.
-// found:false when the quote isn't in this company (e.g. it lives in PRODUCTION while
-// we're pointed at the test instance) — then the price check is reported, not gated.
+// Item-line unit prices for a referenced quote number, via the CLASSIC published pages
+// (the standard salesQuotes API exposes no usable No./lines). Two cases, because reps
+// convert accepted quotes into orders:
+//   • still an OPEN quote  -> Sales_Quote_Excel (No)      + Sales_Quote_ExcelSalesLines
+//   • CONVERTED to an order -> Sales_Order_Excel (Quote_No) + Sales_Order_ExcelSalesLines
+// Returns our-item(normalized) -> { unitPrice, quote, via }. Charge/freight lines are
+// skipped (Type != Item). found:false if the number is neither in this company (e.g. it
+// lives in a different instance) — then the price check is reported, not gated.
 async function quoteLinePrices(company, quoteNo) {
-  const q = await get(`companies(${company.id})/salesQuotes?$filter=number eq ${odataStr(quoteNo)}&$select=id`);
-  const id = q.json?.value?.[0]?.id;
-  if (!id) return { found: false, prices: new Map() };
-  const lr = await getAll(`companies(${company.id})/salesQuotes(${id})/salesQuoteLines?$select=lineType,lineObjectNumber,quantity,unitPrice`);
-  const prices = new Map();
-  for (const l of lr.rows || []) {
-    if (String(l.lineType || "").toLowerCase() !== "item" || !l.lineObjectNumber) continue; // items only (skip Charge/freight)
-    prices.set(stripSD(l.lineObjectNumber), { unitPrice: Number(l.unitPrice), quote: quoteNo });
+  const C = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const itemsFrom = (rows, via) => {
+    const prices = new Map();
+    for (const l of rows || []) {
+      if (String(l.Type || "").toLowerCase() !== "item" || !l.No) continue; // items only
+      prices.set(stripSD(l.No), { unitPrice: Number(l.Unit_Price), quote: quoteNo, via });
+    }
+    return prices;
+  };
+  // (1) still an open quote
+  const q = await get(encodeURI(`${C}/Sales_Quote_Excel?$filter=No eq ${odataStr(quoteNo)}&$select=No`));
+  if (q.json?.value?.length) {
+    const l = await getAll(encodeURI(`${C}/Sales_Quote_ExcelSalesLines?$filter=Document_No eq ${odataStr(quoteNo)}&$select=Type,No,Unit_Price`));
+    return { found: true, prices: itemsFrom(l.rows, "quote") };
   }
-  return { found: true, prices };
+  // (2) converted to an order — matched by the order's Quote_No
+  const o = await get(encodeURI(`${C}/Sales_Order_Excel?$filter=Quote_No eq ${odataStr(quoteNo)}&$select=No`));
+  const orderNo = o.json?.value?.[0]?.No;
+  if (orderNo) {
+    const l = await getAll(encodeURI(`${C}/Sales_Order_ExcelSalesLines?$filter=Document_No eq ${odataStr(orderNo)}&$select=Type,No,Unit_Price`));
+    return { found: true, prices: itemsFrom(l.rows, `order ${orderNo}`) };
+  }
+  return { found: false, prices: new Map() };
 }
 
 // Compare each resolved order line's unit price to the referenced quote's price for the
@@ -548,12 +565,13 @@ async function checkPrices(company, order, lines, quoteNos) {
     if (!q) { l.priceNote = "item not on the referenced quote"; continue; }
     if (!Number.isFinite(poPrice)) { l.priceNote = `PO line has no price (quote ${q.unitPrice})`; continue; }
     compared++;
+    const src = `BC/Q ${q.quote}${q.via && q.via.startsWith("order") ? ` → ${q.via}` : ""}`;
     if (Math.abs(poPrice - q.unitPrice) > PRICE_TOL) {
       l.priceFlag = true;
-      l.priceNote = `⚠ price ${poPrice} ≠ quote ${q.unitPrice} (BC/Q ${q.quote})`;
+      l.priceNote = `⚠ price ${poPrice} ≠ quote ${q.unitPrice} (${src})`;
       mismatches++;
     } else {
-      l.priceNote = `price matches quote ${q.unitPrice} (BC/Q ${q.quote})`;
+      l.priceNote = `price matches quote ${q.unitPrice} (${src})`;
     }
   }
   return { checked: true, compared, mismatches, quotes: quoteNos, detail: mismatches ? `${mismatches} of ${compared} priced line(s) differ from the quote` : `all ${compared} priced line(s) match the quote` };
