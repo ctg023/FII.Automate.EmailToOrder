@@ -30,12 +30,13 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createHash } from "node:crypto";
-import { collectThreads, fetchAttachmentBytes } from "../ingestion/mailbox.js";
+import { collectThreads, fetchAttachmentBytes, fetchItemAttachmentFiles, fetchThreadByIds } from "../ingestion/mailbox.js";
 import { makeClient, extractOne, countOne } from "../step2-extraction/extract.js";
 import { classifyOne } from "../step3-classification/classify.js";
 import { verifyOrder } from "../step4-bc-verification/verify.js";
 import { findDuplicates, resolveCompany, docExists } from "../step6-order-creation/create.js";
 import { lookupAlias } from "./aliases.js";
+import { mergeThreads, mergeThreadObjects, threadKeys } from "./thread-merge.js";
 import { page } from "./render.js";
 
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
@@ -44,6 +45,9 @@ const PULL_LIMIT = Number(process.env.REVIEW_PULL_LIMIT || 50); // messages to s
 // Live pipeline defaults to Sonnet 5 (cheaper; good for classify/extract at volume);
 // override with MODEL=claude-opus-5 for a run.
 const MODEL = process.env.MODEL || "claude-sonnet-5";
+// Merge PO threads Outlook split across conversations (see thread-merge.js). OFF by
+// default — opt in with MERGE_THREADS=1 or the --merge flag. Preview with --merge-preview.
+const MERGE = process.env.MERGE_THREADS === "1" || process.argv.includes("--merge");
 
 // $ per 1M tokens (mirror of run.js PRICING; keep in sync with the claude-api table).
 const PRICING = {
@@ -93,7 +97,16 @@ async function hydratePdfs(thread) {
   const out = [];
   for (const m of thread.messages) {
     for (const a of m.attachments || []) {
-      if (a.isInline || !isPdf(a)) continue;
+      if (a.isInline) continue;
+      // Forwarded-as-email PO (e.g. Bunn): the attachment is an email, and the real
+      // PO PDF is nested inside it. Dig one level in for the PDF(s).
+      if (/itemAttachment/i.test(a.odataType || "")) {
+        for (const f of await fetchItemAttachmentFiles(m.message_id, a.id)) {
+          if (isPdf(f) && f.contentBytes) out.push({ name: f.name, contentType: f.contentType, bytes: f.contentBytes });
+        }
+        continue;
+      }
+      if (!isPdf(a)) continue;
       const b = await fetchAttachmentBytes(m.message_id, a.id);
       if (b?.contentBytes) out.push({ name: b.name || a.name, contentType: b.contentType || a.contentType, bytes: b.contentBytes });
     }
@@ -147,13 +160,55 @@ function toRecord(thread, order, res, classification) {
   };
 }
 
-async function getThreads() {
+async function getThreads(store) {
   // Inbox only: reps reply from their own mailboxes, not order@, so the shared
   // mailbox's Sent Items doesn't hold the rep side — no point reading it.
   console.log(`Pulling order@ threads (Inbox, up to ${PULL_LIMIT}, read-only)…`);
-  const threads = await collectThreads({ limit: PULL_LIMIT, folders: ["Inbox"] });
-  console.log(`  ${threads.length} thread(s) found.\n`);
+  const raw = await collectThreads({ limit: PULL_LIMIT, folders: ["Inbox"] });
+  let threads = MERGE ? mergeThreads(raw) : raw;                 // (1) merge within the window
+  if (MERGE && store) threads = await mergeWithCache(threads, store); // (2) merge with cached cards
+  const mergedNote = MERGE && threads.length < raw.length ? ` (merged ${raw.length - threads.length} split thread(s))` : "";
+  console.log(`  ${threads.length} thread(s) found${mergedNote}.\n`);
   return threads;
+}
+
+// Cache-aware merge: a split PO's other half often scrolled out of the recent-message
+// pull window but still lives in the store as its own card. Match freshly-pulled
+// threads against cached cards by the same subject keys; on a hit, re-fetch that
+// cached card's messages (fresh, with attachment ids) and fold them into one thread.
+// The absorbed cards are pruned from the store by pruneAbsorbed (via mergedFrom).
+async function mergeWithCache(threads, store) {
+  // Index cached cards by merge key, reconstructing keys from the stored conversation.
+  const keyToCids = new Map();
+  const cachedMids = new Map();
+  for (const [cid, entry] of Object.entries(store.threads || {})) {
+    const conv = entry.record?.conversation;
+    const mids = entry.message_ids;
+    if (!conv?.length || !mids?.length) continue;
+    const keys = threadKeys({ subject: conv.find((m) => m.subject)?.subject, messages: conv });
+    if (!keys.length) continue;
+    cachedMids.set(cid, mids);
+    for (const k of keys) (keyToCids.get(k) || keyToCids.set(k, new Set()).get(k)).add(cid);
+  }
+  if (!keyToCids.size) return threads;
+
+  const out = [];
+  for (const t of threads) {
+    const own = new Set(t.merged ? t.mergedFrom : [t.conversationId]);
+    const hits = new Set();
+    for (const k of threadKeys(t)) for (const cid of keyToCids.get(k) || []) if (!own.has(cid)) hits.add(cid);
+    if (!hits.size) { out.push(t); continue; }
+    const extra = [];
+    for (const cid of hits) {
+      const ft = await fetchThreadByIds(cachedMids.get(cid));
+      if (ft) { ft.conversationId = cid; extra.push(ft); } // keep original cid so it's pruned
+    }
+    if (!extra.length) { out.push(t); continue; }
+    const merged = mergeThreadObjects([t, ...extra]);
+    console.log(`  ↔ merged "${(merged.subject || "").slice(0, 45)}" with ${extra.length} cached card(s) [${merged.mergeKeys?.join(", ")}]`);
+    out.push(merged);
+  }
+  return out;
 }
 
 // FREE: list threads, no Claude, no BC.
@@ -169,6 +224,34 @@ async function cmdThreads() {
   console.log(`  Nothing sent to Claude. Next: --estimate, then --run --limit 1.`);
 }
 
+// When merging is on, a merged card supersedes the single-conversation cache entries
+// it absorbed. Drop those orphans so they leave the queue (the merged card replaces them).
+function pruneAbsorbed(store, threads) {
+  const absorbed = new Set(threads.flatMap((t) => (t.merged ? t.mergedFrom : [])));
+  let n = 0;
+  for (const cid of absorbed) if (store.threads[cid]) { delete store.threads[cid]; n++; }
+  if (n) console.log(`  Pruned ${n} superseded single-conversation card(s) now merged.`);
+}
+
+// FREE (read-only): show which PO threads would merge — both within the pull window
+// and against cached cards — without changing anything. Validate before enabling.
+async function cmdMergePreview() {
+  const store = loadStore();
+  console.log(`Pulling order@ threads (Inbox, up to ${PULL_LIMIT}, read-only)…`);
+  const raw = await collectThreads({ limit: PULL_LIMIT, folders: ["Inbox"] });
+  const merged = await mergeWithCache(mergeThreads(raw), store);
+  const groups = merged.filter((t) => t.merged);
+  console.log(`\n  ${raw.length} pulled thread(s); ${groups.length} PO(s) would merge:\n`);
+  for (const g of groups) {
+    const senders = [...new Set(g.messages.map((m) => m.from).filter(Boolean))];
+    console.log(`  ${g.conversationId}   keys: ${(g.mergeKeys || []).join(", ")}`);
+    console.log(`     "${(g.subject || "").slice(0, 60)}"`);
+    console.log(`     ${g.mergedFrom.length} conversation(s), ${g.messages.length} msg, ${g.messages.reduce((n, m) => n + (m.attachments || []).length, 0)} att · from ${senders.join(", ")}\n`);
+  }
+  if (!groups.length) console.log("  No split threads detected — nothing would merge.");
+  console.log("  Nothing changed (read-only). Enable with MERGE_THREADS=1 or --merge on --run.");
+}
+
 function whichNew(threads, store) {
   return threads.filter((t) => {
     const prev = store.threads[t.conversationId];
@@ -179,8 +262,8 @@ function whichNew(threads, store) {
 // Cheap: estimate the Claude cost for the NEW threads (token count only, incl. PDFs).
 // Measures `limit` threads (or all) and projects across all fresh threads.
 async function cmdEstimate(limit) {
-  const threads = await getThreads();
   const store = loadStore();
+  const threads = await getThreads(store);
   const fresh = whichNew(threads, store);
   const measure = limit ? fresh.slice(0, limit) : fresh;
   console.log(`  ${fresh.length} new/changed thread(s); measuring ${measure.length} to project.\n`);
@@ -203,8 +286,9 @@ async function cmdEstimate(limit) {
 
 // Spends: classify -> extract -> verify the new threads, cache, re-render the queue.
 async function cmdRun(limit) {
-  const threads = await getThreads();
   const store = loadStore();
+  const threads = await getThreads(store);
+  if (MERGE) pruneAbsorbed(store, threads);
   const fresh = whichNew(threads, store);
   const todo = limit ? fresh.slice(0, limit) : fresh;
   console.log(`  ${fresh.length} new/changed thread(s); processing ${todo.length}${limit && fresh.length > limit ? ` (--limit ${limit})` : ""}.\n`);
@@ -337,6 +421,7 @@ async function main() {
   const args = process.argv.slice(2);
   const limFlag = args.indexOf("--limit");
   const limit = limFlag !== -1 ? Number(args[limFlag + 1]) : null;
+  if (args.includes("--merge-preview")) return cmdMergePreview(); // FREE: show proposed merges
   if (args.includes("--threads")) return cmdThreads();
   if (args.includes("--estimate")) return cmdEstimate(limit);
   if (args.includes("--enrich")) return cmdEnrich(); // BC dup-check + save PDFs for cached orders
@@ -344,7 +429,7 @@ async function main() {
   if (args.includes("--reconcile")) return cmdReconcile(); // return orders deleted in BC to the queue
   if (args.includes("--rerender")) return renderFromStore(loadStore()); // re-render cache, no pull
   if (args.includes("--run")) return cmdRun(limit);
-  console.log("Usage:\n  pipeline.js --threads          (FREE: pull + group + list threads)\n  pipeline.js --estimate         (token/cost estimate for new threads)\n  pipeline.js --run [--limit N]  (classify+extract+verify new threads, reconcile, then render)\n  pipeline.js --enrich           (BC dup-check + save PDFs for cached orders)\n  pipeline.js --reconcile        (return orders deleted in BC to the queue)\n  pipeline.js --rerender         (rebuild the page from cache; no pull, no Claude)");
+  console.log("Usage:\n  pipeline.js --threads          (FREE: pull + group + list threads)\n  pipeline.js --merge-preview    (FREE: show PO threads that would merge; no changes)\n  pipeline.js --estimate         (token/cost estimate for new threads)\n  pipeline.js --run [--limit N]  (classify+extract+verify new threads, reconcile, then render)\n  pipeline.js --enrich           (BC dup-check + save PDFs for cached orders)\n  pipeline.js --reconcile        (return orders deleted in BC to the queue)\n  pipeline.js --rerender         (rebuild the page from cache; no pull, no Claude)\n  (add MERGE_THREADS=1 or --merge to fold split PO threads into one card on --run)");
 }
 
 main().catch((e) => { console.error(e.message || e); process.exit(1); });

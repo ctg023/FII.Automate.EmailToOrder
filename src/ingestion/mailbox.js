@@ -91,6 +91,23 @@ export async function fetchAttachmentBytes(messageId, attachmentId) {
   return { name: r.json.name, contentType: r.json.contentType, contentBytes: r.json.contentBytes || null };
 }
 
+// Read-only: some senders (e.g. Bunn) forward the PO as an EMAIL attached to the
+// email — a Graph `itemAttachment` (message/rfc822) whose real PO PDF is nested one
+// level down inside that attached message. Graph can't address the nested email's
+// attachments by URL path (that segment 400s), but a nested $expand returns them
+// inline WITH contentBytes. Return the nested file attachments (metadata + bytes) so
+// the caller can filter to PDFs. Returns [] on any failure or non-item attachment.
+export async function fetchItemAttachmentFiles(messageId, attachmentId) {
+  const r = await gget(
+    `${mbPath()}/messages/${encodeURIComponent(messageId)}/attachments/${attachmentId}` +
+    `?$expand=microsoft.graph.itemAttachment/item($expand=microsoft.graph.message/attachments)`
+  );
+  const nested = r.json?.item?.attachments || [];
+  return nested
+    .filter((a) => /fileAttachment/i.test(a["@odata.type"] || "") && !a.isInline)
+    .map((a) => ({ name: a.name, contentType: a.contentType, isInline: a.isInline, contentBytes: a.contentBytes || null }));
+}
+
 // Read-only: collect recent messages across folders (Inbox = inbound customer mail,
 // SentItems = outbound rep replies), fetch each full body, and group into threads by
 // Graph conversationId — so a PO and its whole back-and-forth are one unit. Never
@@ -106,17 +123,9 @@ export async function collectThreads({ limit = 50, folders = ["Inbox", "SentItem
     for (const h of heads) {
       const { msg, atts } = await fetchMessage(h.id);
       if (!msg) continue;
-      const conv = msg.conversationId || msg.id;
-      const rec = {
-        message_id: msg.id, conversationId: conv, direction,
-        received: msg.receivedDateTime, from: senderOf(msg),
-        to: (msg.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean),
-        subject: msg.subject,
-        body_text: (msg.body?.contentType === "html" ? htmlToText(msg.body?.content) : msg.body?.content) || "",
-        attachments: atts.map((a) => ({ id: a.id, name: a.name, contentType: a.contentType, size: a.size, isInline: a.isInline })),
-      };
-      if (!byConv.has(conv)) byConv.set(conv, []);
-      byConv.get(conv).push(rec);
+      const rec = msgRecord(msg, atts, direction);
+      if (!byConv.has(rec.conversationId)) byConv.set(rec.conversationId, []);
+      byConv.get(rec.conversationId).push(rec);
     }
   }
   const threads = [];
@@ -134,6 +143,41 @@ export async function collectThreads({ limit = 50, folders = ["Inbox", "SentItem
   }
   threads.sort((a, b) => (b.last_received || "").localeCompare(a.last_received || ""));
   return threads;
+}
+
+// One message -> the thread-message record shape used above (and by fetchThreadByIds).
+function msgRecord(msg, atts, direction = "inbound") {
+  return {
+    message_id: msg.id, conversationId: msg.conversationId || msg.id, direction,
+    received: msg.receivedDateTime, from: senderOf(msg),
+    to: (msg.toRecipients || []).map((r) => r.emailAddress?.address).filter(Boolean),
+    subject: msg.subject,
+    body_text: (msg.body?.contentType === "html" ? htmlToText(msg.body?.content) : msg.body?.content) || "",
+    attachments: (atts || []).map((a) => ({ id: a.id, name: a.name, contentType: a.contentType, size: a.size, isInline: a.isInline, odataType: a["@odata.type"] })),
+  };
+}
+
+// Read-only: rebuild a thread object from a known set of message ids (e.g. a cached
+// card's message_ids). Used by cache-aware thread-merge to pull a split PO's other
+// half — which has scrolled out of the recent-message pull window — back in, fresh
+// (with attachment ids), so its PDFs hydrate and it re-extracts as one unit. Returns
+// null if none resolve. Direction defaults to inbound (order@ Inbox is inbound mail).
+export async function fetchThreadByIds(messageIds, direction = "inbound") {
+  const messages = [];
+  for (const id of messageIds || []) {
+    const { msg, atts } = await fetchMessage(id);
+    if (msg) messages.push(msgRecord(msg, atts, direction));
+  }
+  if (!messages.length) return null;
+  messages.sort((a, b) => (a.received || "").localeCompare(b.received || ""));
+  const last = messages[messages.length - 1];
+  return {
+    conversationId: messages[0].conversationId,
+    subject: messages.find((m) => m.subject)?.subject || "(no subject)",
+    messages, last_received: last?.received || null,
+    has_attachments: messages.some((m) => m.attachments.length),
+    message_ids: messages.map((m) => m.message_id),
+  };
 }
 
 async function cmdList(limit) {
