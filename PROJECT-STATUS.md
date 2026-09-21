@@ -18,6 +18,9 @@ Live-backlog hardening from working real orders in the review app:
 - **Assign re-scans Rules 4 & 5** — changing a customer in the app (`/api/assign`) now updates the
   **Ship-To / Contact** panels for the new customer (previously left stale, so a matched customer could
   still show a red ship-to/contact from the pre-change verify).
+- **Quantity-increment gate** (verify.js) — piece quantities must be whole multiples of **100** (fasteners
+  ship in hundreds); a non-multiple (e.g. 120, 2120, 2150) routes the order to review. Tune/disable via
+  `QTY_STEP`. (Applies only to piece quantities; non-piece UoM is already flagged separately.)
 
 ## Where we are
 Working through the brief's build order. **Steps 1–3 done. Step 4 in progress:** BC connectivity

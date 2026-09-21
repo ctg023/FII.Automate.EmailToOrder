@@ -330,6 +330,15 @@ function uomNeedsReview(orderUom, baseUom) {
   return true;                                             // multiplier/other unit -> human must set qty
 }
 
+// Piece quantities must be whole multiples of this many pieces — fasteners ship in
+// hundreds, so 2100/2200/3000/5000 are valid but 2120/2150 are not. A non-multiple is
+// usually a typo or a pack/each mix-up, so route it to a human. Applies only to PIECE
+// quantities (a non-piece UoM is already flagged by uomNeedsReview). Override QTY_STEP=1
+// to disable. Configurable via env.
+const QTY_STEP = Number(process.env.QTY_STEP || 100);
+const qtyNeedsReview = (qty, uomFlag) =>
+  !uomFlag && QTY_STEP > 1 && Number.isFinite(qty) && qty > 0 && qty % QTY_STEP !== 0;
+
 // Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then inventory.
 async function checkLine(company, line, custNo) {
   const supplier = (line.supplier_part || "").trim();
@@ -393,12 +402,16 @@ async function checkLine(company, line, custNo) {
   const onHand = Number(item.inventory ?? 0);
   const enough = onHand >= qty;
   const uomFlag = uomNeedsReview(line.uom, item.baseUnitOfMeasureCode);
+  const qtyFlag = qtyNeedsReview(qty, uomFlag);
   const uomNote = uomFlag
     ? ` [⚠ UoM needs review: order "${line.uom}" is a multiplier, not pieces (base "${item.baseUnitOfMeasureCode}") — quantity not safe to create]`
     : "";
+  const qtyNote = qtyFlag
+    ? ` [⚠ quantity ${qty} is not a multiple of ${QTY_STEP} pieces — confirm before creating]`
+    : "";
   return {
-    label, pass: enough, rule2: true, item: item.number, via, uomFlag,
-    detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}`,
+    label, pass: enough, rule2: true, item: item.number, via, uomFlag, qtyFlag,
+    detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}`,
   };
 }
 
@@ -521,6 +534,7 @@ export async function verifyOrder(order, opts = {}) {
   const resolved = lines.filter((l) => l.rule2).length;
   const gateParts = lines.length > 0 && lines.every((l) => l.rule2);
   const uomIssue = lines.some((l) => l.uomFlag); // non-piece unit -> qty not safe to auto-create
+  const qtyIssue = lines.some((l) => l.qtyFlag); // piece qty not a multiple of QTY_STEP (e.g. 2120)
   const allInStock = gateParts && lines.every((l) => l.pass);
   const multiPO = multiplePOs(order.po_number); // one email carrying 2+ POs
   let disposition, dispositionReason;
@@ -538,6 +552,10 @@ export async function verifyOrder(order, opts = {}) {
     disposition = "review";
     const n = lines.filter((l) => l.uomFlag).length;
     dispositionReason = `${n} line(s) use a non-piece unit (e.g. 100PACK / M / C) — a human must confirm the quantity before creating`;
+  } else if (qtyIssue) {
+    disposition = "review";
+    const bad = lines.filter((l) => l.qtyFlag);
+    dispositionReason = `${bad.length} line(s) have a quantity that is not a multiple of ${QTY_STEP} pieces (${bad.map((l) => l.label).slice(0, 3).join(", ")}) — confirm the quantity before creating`;
   }
   // Customer + parts + UoM all clean → Rules 4 & 5: ship-to and contact.
   // Ship-to is a hard gate. Contact is INFORMATIONAL by default: BC does not store the

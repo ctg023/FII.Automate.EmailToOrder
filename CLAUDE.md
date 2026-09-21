@@ -24,7 +24,9 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   `RW2114OHIO`→`RW-2114`; both require a unique BC match) · **3** stock · **4** ship-to matches a `ShipTo` on file
   (hard gate) · **5** contact/email matches a Person contact under the customer's company contact
   (`Contact`/`ContactBusinessRelation`; **informational unless `CONTACT_GATE=1`**). Also gates: non-piece
-  **UoM** (100PACK/M/C → review) and **multi-PO-in-one-email** → review. `--batch <dir> --json <out>` emits records.
+  **UoM** (100PACK/M/C → review), **piece quantity not a multiple of 100** (fasteners ship in hundreds;
+  e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), and **multi-PO-in-one-email** → review.
+  `--batch <dir> --json <out>` emits records.
 - **Step 5 (review app):** **LIVE, end-to-end.**
   - `pipeline.js` — live runner: pulls `order@` Inbox, groups messages into **threads by conversationId**
     (Inbox-only — reps reply from their own mailboxes, so Sent isn't captured), classify→extract(w/ PDFs)→
