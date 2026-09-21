@@ -97,6 +97,10 @@ async function handle(req, res) {
       const res2 = await verifyOrder(orderFromRecord(entry.record), { forceCustomer: { number: customerNumber, displayName: customerName } });
       const r = entry.record;
       r.rule1 = res2.rule1; r.lines = res2.lines; r.linesPass = res2.linesPass;
+      // Re-scan Rules 4 & 5 against the newly-assigned customer (verifyOrder already
+      // computed them) so the Ship-To / Contact panels reflect the new customer, not
+      // the stale pre-change result.
+      r.shipTo = res2.shipTo; r.contact = res2.contact;
       r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
       r.customer_assigned = { number: customerNumber, name: customerName };
       saveStore(store);
