@@ -244,6 +244,26 @@ function descPartCandidates(description, partFields = []) {
   return [...anchored, ...leading];
 }
 
+// A part FIELD can be the real part number followed by crammed-in description words,
+// e.g. "HS3 M6 PROJECTION WELD NUT" where the item is "HS3 M6". Try progressively
+// longer LEADING token-prefixes of the field and take the LONGEST that uniquely
+// resolves (the most complete part number; trailing tokens are descriptive noise).
+// resolveItem hits the in-memory item index, so these extra tries cost no BC calls.
+async function resolvePartFieldPrefix(company, fields) {
+  let best = null;
+  for (const field of fields) {
+    const toks = String(field || "").trim().split(/\s+/).filter(Boolean);
+    if (toks.length < 2) continue;                    // single-token fields already tried directly
+    const maxLen = Math.min(toks.length - 1, 5);      // strictly shorter than the whole field
+    for (let k = 1; k <= maxLen; k++) {
+      const pn = toks.slice(0, k).join(" ");
+      const r = await resolveItem(company, pn);
+      if (r.item) best = { item: r.item, pn };        // keep the longest unique match
+    }
+  }
+  return best;
+}
+
 // Item index: our whole item master, keyed by BOTH the slash-kept and slash-removed
 // normalized forms, so a part matches whether or not the slash is present, while the
 // slash stays real for the item that has one. Loaded once, cached for the process.
@@ -342,7 +362,14 @@ async function checkLine(company, line, custNo) {
     }
   }
 
-  // Rule 2, path (c) DESCRIPTION-ANCHORED — clean part in the description when the
+  // Rule 2, path (c) PART-FIELD PREFIX — real part + crammed description words in one
+  // field (e.g. "HS3 M6 PROJECTION WELD NUT" -> item "HS3 M6").
+  if (!item) {
+    const best = await resolvePartFieldPrefix(company, [supplier, customer]);
+    if (best) { item = best.item; via = `part prefix "${best.pn}"`; }
+  }
+
+  // Rule 2, path (d) DESCRIPTION-ANCHORED — clean part in the description when the
   // part field carries a trailing tag (e.g. "RW2114OHIO" -> description "RW-2114").
   if (!item) {
     for (const pn of descPartCandidates(line.description, [supplier, customer])) {
