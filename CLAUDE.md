@@ -10,15 +10,18 @@ created in BC. Goal: cut manual order entry for ~10 reps while keeping a human i
 
 **A human approves every order before it is created in BC. No auto-create — ever, at least through rollout.**
 
-## Status (2026-09-20)
+## Status (2026-09-21)
 See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed status — keep that current too.
 - **Step 1 (sample set):** done — 50 labeled sample emails in `samples/` (29 order, 8 ambiguous, 13 not_order).
 - **Step 2 (extraction):** done — harness in `src/step2-extraction/`; ~100% on order content. Now also sends
   **native PDF bytes** as document blocks (`buildMessageContent`), so real/scanned PDFs are read directly.
 - **Step 3 (classification):** done — harness in `src/step3-classification/`; 92%, **0 dropped orders**.
-- **Step 4 (BC verification):** done (read-only v1) — `src/step4-bc-verification/verify.js` resolves customer
-  (Rule 1) + line items via direct/cross-ref (Rule 2) + stock (Rule 3), and assigns a **disposition**
-  (Order / Quote / Needs-review). `--batch <dir> --json <out>` emits structured per-order records.
+- **Step 4 (BC verification):** done (read-only) — `src/step4-bc-verification/verify.js` assigns a
+  **disposition** (Order / Quote / Needs-review). Rules: **1** customer name match · **2** line items
+  (direct / cross-ref via `Item_References_Excel`) · **3** stock · **4** ship-to matches a `ShipTo` on file
+  (hard gate) · **5** contact/email matches a Person contact under the customer's company contact
+  (`Contact`/`ContactBusinessRelation`; **informational unless `CONTACT_GATE=1`**). Also gates: non-piece
+  **UoM** (100PACK/M/C → review) and **multi-PO-in-one-email** → review. `--batch <dir> --json <out>` emits records.
 - **Step 5 (review app):** **LIVE, end-to-end.**
   - `pipeline.js` — live runner: pulls `order@` Inbox, groups messages into **threads by conversationId**
     (Inbox-only — reps reply from their own mailboxes, so Sent isn't captured), classify→extract(w/ PDFs)→
@@ -28,14 +31,23 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     guarded create** to BC260TEST/Fasteners (writes a real Sales Order/Quote). Created docs are marked
     actioned (leave the queue), **deep-link back to BC** (needs `BC_WEB_URL`), and are **reconciled** — if the
     BC doc is later deleted the order returns to the queue. Cards flag **PO-already-in-BC** and link the source PDF.
+  - **Customer fix-up:** unmatched (or wrong) customers get suggestions + a **BC customer search** + a
+    **change** link on matched cards; every pick is saved as a **learned alias** (`src/step5-review/aliases.js`,
+    `data/`, keyed by email domain + name) consulted *before* name-matching, so recurring customers stop
+    needing review. Created orders set the matched **ship-to address + contact** on the BC doc.
+  - Commands: `pipeline.js --run` (process new mail) · `--reverify` (re-apply rules to cache, no Claude) ·
+    `--enrich` (dup-check + save PDFs) · `--reconcile` · `--rerender`. `server.js` serves the app.
 - **Step 6 (order creation):** write **proven** — `src/step6-order-creation/create.js`; `createDoc()` is the
   programmatic path the server calls. Dry-run default; guarded real write. ⚠️ BC assigns a **default** number
   series until the `EMAILORDER` No.-Series **AL codeunit is deployed** (developer task — then S-ORD-EMAIL/S-QUO-EMAIL).
 - **Ingestion (Track A):** **LIVE** — Entra app + `.env` done; `mailbox.js --check` green; reads
   `order@buckeyefasteners.com` (singular). ⚠️ **Application Access Policy fence NOT yet applied** (app can read
   ALL mailboxes) — must do before pilot.
-- Next: server **auth** (none yet), mailbox **Access Policy fence**, **accuracy pass** on the live backlog;
-  then pilot with 1–2 reps. Backlog idea: **item-level quote history / rate-shopping visibility** (see PROJECT-STATUS).
+- Accuracy pass **done** (found+fixed UoM, multi-PO, PDF-folder collision). Live backlog processed (full 188
+  Inbox → ~85 real orders). **Open decisions:** (1) enable `CONTACT_GATE=1`? (works now; email match needs
+  prod) (2) build the **mailbox move-on-approve** cleanup (needs `Mail.ReadWrite`)? (3) server **auth**,
+  mailbox **Access Policy fence**, deploy the **EMAILORDER codeunit** — all before pilot. Backlog idea:
+  item-level quote history / rate-shopping (see PROJECT-STATUS).
 
 ## Stack & architecture
 - **Node.js (ESM)** throughout. No build step; run `.js` directly with `node`.
@@ -54,6 +66,9 @@ src/step4-bc-verification/# ping.js (connectivity), data-quality.js, verify.js (
 src/step5-review/         # LIVE review app: pipeline.js (ingest→classify→extract→verify→cache),
                           #   render.js (page), server.js (serves page + approve/preview/refresh endpoints)
 src/step6-order-creation/ # create.js = BC Sales Order / Quote write; createDoc()/docExists() exported for server
+bc-extension/             # AL codeunit + README for the EMAILORDER number series (developer handoff)
+docs/                     # Email-Order-Review-Guide.pdf (rep-facing user guide)
+data/                     # git-ignored: learned customer aliases (PII)
 samples/                  # test set. README + extraction-schema.json are committed;
                           #   raw/, answer-keys/, manifest.csv, FINDINGS.md are git-ignored (customer data)
 out/                      # git-ignored render/verify output (contains PII) — e.g. verified.json, review.html
@@ -118,6 +133,20 @@ Reminder: `create.js --create` (Step 6) is the only thing that WRITES to BC; the
   (until it is, the app can read every mailbox in the tenant) — do before pilot. See `src/ingestion/README.md`.
 - **BC write target** for the live app = **BC260TEST / `Fasteners`** (`BC_COMPANY`), a dev/test instance —
   never production first. `BC_WEB_URL` (browser base URL) drives the review app's deep links back to BC.
+  ⚠️ **BC260TEST has contact emails SCRUBBED** to `navl@buckeyefasteners.com`; **production has the real
+  buyer emails.** So Rule 5 matches by **name** in test, by **email** in prod — validate email matching only
+  against prod.
+- **BC OData services used** (classic `/ODataV4`, published pages — NOT standard API v2.0):
+  `Item_References_Excel` (customer part → item), `ShipTo` (Customer_No + Code + address), `Contact` +
+  `ContactBusinessRelation`. **Customers' buyers are Person `Contact`s linked by `Company_No`** to the
+  customer's company contact (found via `ContactBusinessRelation`). Order creation uses standard API v2.0.
+- **Mailbox cleanup is the primary goal** (reps spend all day managing `order@`). Plan (decided, NOT built):
+  on **Approve→create**, move that thread's emails to an **"Entered in BC"** folder; leave everything else for
+  reps. Needs **`Mail.ReadWrite`** (escalation from `Mail.Read`) + the Access Policy fence FIRST. This flips the
+  "mailbox is read-only" rule — update it if/when built. Pending/handled-outside-app emails still need a plan
+  (a manual "File/Close" action + an aging view).
+- **BC AL codeunit for numbering** is drafted for the developer in `bc-extension/` (EMAILORDER No. Series);
+  not yet deployed. A rep-facing **user guide PDF** is in `docs/Email-Order-Review-Guide.pdf`.
 
 ## Data & integration notes
 - The M365 Graph connector returns attachment **extracted text, not native files**; **scanned or
