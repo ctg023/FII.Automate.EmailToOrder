@@ -21,6 +21,7 @@ import { createDoc } from "../step6-order-creation/create.js";
 import { verifyOrder, searchCustomers } from "../step4-bc-verification/verify.js";
 import { setAlias } from "./aliases.js";
 import { page, firstEmailDate } from "./render.js";
+import { bcqNumbers } from "./thread-merge.js";
 
 const PORT = Number(process.env.REVIEW_PORT || 8787);
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
@@ -50,6 +51,7 @@ const orderFromRecord = (rec) => ({
   customer: rec.customer, po_number: rec.po_number, order_date: rec.order_date,
   requested_ship_date: (rec.requested_ship_date && String(rec.requested_ship_date).trim()) || firstEmailDate(rec),
   ship_to: rec.ship_to, line_items: rec.line_items,
+  quote_refs: rec.quote_refs?.length ? rec.quote_refs : [...new Set((rec.conversation || []).flatMap((m) => bcqNumbers(m.subject || "")))],
 });
 
 // Open queue = cached order/quote/review records not yet actioned.

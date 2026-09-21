@@ -23,10 +23,14 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   and **description-anchored**: clean part in the description when the part field carries a tag, e.g.
   `RW2114OHIO`→`RW-2114`; both require a unique BC match) · **3** stock · **4** ship-to matches a `ShipTo` on file
   (hard gate) · **5** contact/email matches a Person contact under the customer's company contact
-  (`Contact`/`ContactBusinessRelation`; **informational unless `CONTACT_GATE=1`**). Also gates: non-piece
-  **UoM** (100PACK/M/C → review), **piece quantity not a multiple of 100** (fasteners ship in hundreds;
-  e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), and **multi-PO-in-one-email** → review.
-  `--batch <dir> --json <out>` emits records.
+  (`Contact`/`ContactBusinessRelation`; **informational unless `CONTACT_GATE=1`**) · **6** price matches the
+  **referenced BC quote** — extract the **BC/Q #** from the subject, look up `salesQuotes`(number)→lines, and
+  compare each item's `unitPrice` to the PO's (exact by default; `PRICE_TOL` per-unit $ tolerance); mismatch →
+  review. ⚠️ Many referenced quotes live in **production**, not BC260TEST (its quotes are header-only), so the
+  price check **validates against prod** — in test it reports "quote not in this company" and does not gate.
+  Also gates: non-piece **UoM** (100PACK/M/C → review), **piece quantity not a multiple of 100** (fasteners
+  ship in hundreds; e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), and **multi-PO-in-one-email** →
+  review. `--batch <dir> --json <out>` emits records.
 - **Step 5 (review app):** **LIVE, end-to-end.**
   - `pipeline.js` — live runner: pulls `order@` Inbox, groups messages into **threads by conversationId**
     (Inbox-only — reps reply from their own mailboxes, so Sent isn't captured), classify→extract(w/ PDFs)→

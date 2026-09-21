@@ -507,6 +507,58 @@ export async function searchCustomers(q, limit = 15) {
     .map((c) => ({ number: c.number, displayName: c.displayName, city: c.city, state: c.state }));
 }
 
+// --- Rule 6: price match against the referenced BC quote (the "BC/Q #") ----------
+// Prices must match; PRICE_TOL is a per-unit $ tolerance (0 = exact, the default).
+const PRICE_TOL = Number(process.env.PRICE_TOL || 0);
+
+// Item-line unit prices of a BC sales quote, by number (standard API v2.0):
+// our-item-number(normalized) -> { unitPrice, quote }. Charge/freight lines are skipped.
+// found:false when the quote isn't in this company (e.g. it lives in PRODUCTION while
+// we're pointed at the test instance) — then the price check is reported, not gated.
+async function quoteLinePrices(company, quoteNo) {
+  const q = await get(`companies(${company.id})/salesQuotes?$filter=number eq ${odataStr(quoteNo)}&$select=id`);
+  const id = q.json?.value?.[0]?.id;
+  if (!id) return { found: false, prices: new Map() };
+  const lr = await getAll(`companies(${company.id})/salesQuotes(${id})/salesQuoteLines?$select=lineType,lineObjectNumber,quantity,unitPrice`);
+  const prices = new Map();
+  for (const l of lr.rows || []) {
+    if (String(l.lineType || "").toLowerCase() !== "item" || !l.lineObjectNumber) continue; // items only (skip Charge/freight)
+    prices.set(stripSD(l.lineObjectNumber), { unitPrice: Number(l.unitPrice), quote: quoteNo });
+  }
+  return { found: true, prices };
+}
+
+// Compare each resolved order line's unit price to the referenced quote's price for the
+// same item. Sets l.priceFlag / l.priceNote per line. Returns a summary.
+async function checkPrices(company, order, lines, quoteNos) {
+  if (!quoteNos.length) return { checked: false, detail: "no BC/Q number referenced" };
+  const byItem = new Map();
+  let anyFound = false;
+  for (const qn of quoteNos) {
+    const { found, prices } = await quoteLinePrices(company, qn);
+    if (found) { anyFound = true; for (const [k, v] of prices) if (!byItem.has(k)) byItem.set(k, v); }
+  }
+  if (!anyFound) return { checked: false, detail: `referenced quote(s) ${quoteNos.join(", ")} not in ${company.name} (may live in production)` };
+  let compared = 0, mismatches = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.item) continue;
+    const poPrice = Number(order.line_items?.[i]?.unit_price);
+    const q = byItem.get(stripSD(l.item));
+    if (!q) { l.priceNote = "item not on the referenced quote"; continue; }
+    if (!Number.isFinite(poPrice)) { l.priceNote = `PO line has no price (quote ${q.unitPrice})`; continue; }
+    compared++;
+    if (Math.abs(poPrice - q.unitPrice) > PRICE_TOL) {
+      l.priceFlag = true;
+      l.priceNote = `⚠ price ${poPrice} ≠ quote ${q.unitPrice} (BC/Q ${q.quote})`;
+      mismatches++;
+    } else {
+      l.priceNote = `price matches quote ${q.unitPrice} (BC/Q ${q.quote})`;
+    }
+  }
+  return { checked: true, compared, mismatches, quotes: quoteNos, detail: mismatches ? `${mismatches} of ${compared} priced line(s) differ from the quote` : `all ${compared} priced line(s) match the quote` };
+}
+
 export async function verifyOrder(order, opts = {}) {
   const company = await resolveCompany();
   let r1;
@@ -526,6 +578,10 @@ export async function verifyOrder(order, opts = {}) {
   const lines = [];
   for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo));
 
+  // Rule 6 — price match against the referenced BC quote (exact by default). Sets
+  // per-line priceFlag/priceNote; a mismatch gates to review below.
+  const priceRes = await checkPrices(company, order, lines, (order.quote_refs || []).filter(Boolean));
+
   // Disposition: what document to create in BC (after a human approves).
   //   Gates that force a human: customer not matched with high certainty, OR any
   //   line not resolved to a BC item. Otherwise stock ROUTES the document type:
@@ -535,6 +591,7 @@ export async function verifyOrder(order, opts = {}) {
   const gateParts = lines.length > 0 && lines.every((l) => l.rule2);
   const uomIssue = lines.some((l) => l.uomFlag); // non-piece unit -> qty not safe to auto-create
   const qtyIssue = lines.some((l) => l.qtyFlag); // piece qty not a multiple of QTY_STEP (e.g. 2120)
+  const priceIssue = priceRes.checked && priceRes.mismatches > 0; // PO price != referenced quote
   const allInStock = gateParts && lines.every((l) => l.pass);
   const multiPO = multiplePOs(order.po_number); // one email carrying 2+ POs
   let disposition, dispositionReason;
@@ -556,6 +613,9 @@ export async function verifyOrder(order, opts = {}) {
     disposition = "review";
     const bad = lines.filter((l) => l.qtyFlag);
     dispositionReason = `${bad.length} line(s) have a quantity that is not a multiple of ${QTY_STEP} pieces (${bad.map((l) => l.label).slice(0, 3).join(", ")}) — confirm the quantity before creating`;
+  } else if (priceIssue) {
+    disposition = "review";
+    dispositionReason = `${priceRes.mismatches} line(s) priced differently from the referenced quote (BC/Q ${priceRes.quotes.join(", ")}) — confirm the price before creating`;
   }
   // Customer + parts + UoM all clean → Rules 4 & 5: ship-to and contact.
   // Ship-to is a hard gate. Contact is INFORMATIONAL by default: BC does not store the
@@ -577,7 +637,7 @@ export async function verifyOrder(order, opts = {}) {
       disposition = "quote"; dispositionReason = `customer & ship-to matched; one or more lines short → quote${contactNote}`;
     }
   }
-  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes };
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes };
 }
 
 const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };

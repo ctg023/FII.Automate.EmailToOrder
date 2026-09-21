@@ -21,6 +21,15 @@ Live-backlog hardening from working real orders in the review app:
 - **Quantity-increment gate** (verify.js) — piece quantities must be whole multiples of **100** (fasteners
   ship in hundreds); a non-multiple (e.g. 120, 2120, 2150) routes the order to review. Tune/disable via
   `QTY_STEP`. (Applies only to piece quantities; non-piece UoM is already flagged separately.)
+- **Order dates + special instructions** surfaced on each card; requested/ship date **falls back to the 1st
+  email date** when the PO states none (and populates on the created BC order). Line item shows **✕** (not a
+  green ✓) when a qty/UoM/price problem blocks creation.
+- **Price match vs referenced quote (Rule 6)** — extract the **BC/Q #** from the subject, look up the BC
+  `salesQuote` and compare each item's `unitPrice` to the PO's (**exact** by default, `PRICE_TOL` to loosen);
+  mismatch → review. Confirmed the field mapping (`salesQuotes.number` = BC/Q #, lines carry `unitPrice`) and
+  validated the logic against quote 228874 (PO NS313502 matched to the 4th decimal). ⚠️ **Prod-validated**:
+  the referenced quotes largely live in production; **BC260TEST quotes are header-only (no lines)**, so in
+  test the check reports "quote not in this company" and does not gate — validate real matches against prod.
 
 ## Where we are
 Working through the brief's build order. **Steps 1–3 done. Step 4 in progress:** BC connectivity

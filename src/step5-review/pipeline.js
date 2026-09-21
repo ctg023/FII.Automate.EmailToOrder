@@ -36,7 +36,7 @@ import { classifyOne } from "../step3-classification/classify.js";
 import { verifyOrder } from "../step4-bc-verification/verify.js";
 import { findDuplicates, resolveCompany, docExists } from "../step6-order-creation/create.js";
 import { lookupAlias } from "./aliases.js";
-import { mergeThreads, mergeThreadObjects, threadKeys } from "./thread-merge.js";
+import { mergeThreads, mergeThreadObjects, threadKeys, bcqNumbers } from "./thread-merge.js";
 import { page } from "./render.js";
 
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
@@ -147,6 +147,13 @@ async function verifyWithAlias(order, existing) {
   return { res: await verifyOrder(order), assigned: null };
 }
 
+// BC/Q number(s) referenced anywhere in a thread's subjects — for the price check.
+const quoteRefsFromThread = (t) =>
+  [...new Set([t.subject, ...(t.messages || []).map((m) => m.subject)].flatMap((s) => bcqNumbers(s || "")))];
+// Same, from a stored record's conversation (for reverify/create on the backlog).
+const quoteRefsFromRecord = (rec) =>
+  rec.quote_refs?.length ? rec.quote_refs : [...new Set((rec.conversation || []).flatMap((m) => bcqNumbers(m.subject || "")))];
+
 // Assemble the review record the renderer expects from an extracted order + verify result.
 function toRecord(thread, order, res, classification) {
   return {
@@ -154,8 +161,9 @@ function toRecord(thread, order, res, classification) {
     po_number: order.po_number, order_date: order.order_date, requested_ship_date: order.requested_ship_date,
     customer: order.customer, ship_to: order.ship_to, line_items: order.line_items,
     special_instructions: order.notes || null, // PO/email special instructions (surfaced on the card)
+    quote_refs: order.quote_refs || [],         // referenced BC/Q number(s), for the price check
     company: res.company, rule1: res.rule1, lines: res.lines, linesPass: res.linesPass,
-    shipTo: res.shipTo, contact: res.contact,
+    shipTo: res.shipTo, contact: res.contact, price: res.price,
     disposition: res.disposition, dispositionReason: res.dispositionReason,
     classification, conversation: conversationOf(thread), last_received: thread.last_received,
   };
@@ -314,6 +322,7 @@ async function cmdRun(limit) {
     let order, res, assigned;
     try { order = (await extractOne(client, sample, { model: MODEL })).parsed_output; }
     catch (e) { console.log(`  ! ${t.subject?.slice(0, 40)} — extract failed: ${e.message}`); continue; }
+    order.quote_refs = quoteRefsFromThread(t); // referenced BC/Q # for the price check
     try { ({ res, assigned } = await verifyWithAlias(order)); }
     catch (e) { console.log(`  ! ${t.subject?.slice(0, 40)} — verify failed: ${e.message}`); continue; }
     const record = toRecord(t, order, res, classification);
@@ -379,12 +388,12 @@ async function cmdReverify() {
   console.log(`Re-verifying ${targets.length} cached order(s) against BC (no Claude)…\n`);
   for (const x of targets) {
     const r = x.record;
-    const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items };
+    const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items, quote_refs: quoteRefsFromRecord(r) };
     try {
       const { res, assigned } = await verifyWithAlias(order, r.customer_assigned);
       const was = x.disposition;
       r.rule1 = res.rule1; r.lines = res.lines; r.linesPass = res.linesPass;
-      r.shipTo = res.shipTo; r.contact = res.contact;
+      r.shipTo = res.shipTo; r.contact = res.contact; r.price = res.price;
       r.disposition = res.disposition; r.dispositionReason = res.dispositionReason; x.disposition = res.disposition;
       if (assigned) r.customer_assigned = { number: assigned.number, name: assigned.name };
       console.log(`  ${was === res.disposition ? " " : "→"} ${res.disposition.padEnd(6)} PO ${r.po_number} · ${r.customer?.name || ""}${was !== res.disposition ? `  (was ${was})` : ""}`);

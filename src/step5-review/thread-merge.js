@@ -40,6 +40,9 @@ export function poKeys(subject) {
   }
   return [...out];
 }
+// The bare BC/Q number(s) in a subject/body, e.g. "228874" — for the price check.
+export const bcqNumbers = (text) => bcqKeys(text).map((k) => k.slice(4));
+
 // All merge keys for a thread (scan every message subject, not just the base one).
 export function threadKeys(thread) {
   const keys = new Set();
