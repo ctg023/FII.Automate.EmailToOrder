@@ -60,20 +60,13 @@ function lineRow(l) {
       </div></div>`;
 }
 
-// Earliest message date in a record's conversation — the "1st email date", used as
-// the requested/ship-date fallback when the PO states none. ISO string or "".
-export function firstEmailDate(r) {
-  const ds = (r.conversation || []).map((m) => m.received).filter(Boolean).sort();
-  return ds[0] || r.last_received || "";
-}
-
-// Order details: dates (order date, requested/ship — with the 1st-email fallback shown
-// when the PO gave none) and any special instructions (highlighted so a rep can't miss).
+// Order details: dates (order date, requested/ship) and any special instructions
+// (highlighted so a rep can't miss them). When the PO states no requested date, BC gets
+// today's order-entry date at creation (and the line Shipment Date matches) — so note that.
 function orderDetailsBlock(r) {
   const req = r.requested_ship_date && String(r.requested_ship_date).trim();
-  const fb = !req ? firstEmailDate(r) : "";
-  const reqShown = req || (fb ? fb.slice(0, 10) : "");
-  const reqNote = req ? "" : (fb ? ` <span style="color:var(--muted)">(from 1st email — none on PO)</span>` : "");
+  const reqShown = req || "order-entry date (today)";
+  const reqNote = req ? "" : ` <span style="color:var(--muted)">(none on PO — today's date filled at creation; Shipment Date matches)</span>`;
   const si = r.special_instructions && String(r.special_instructions).trim();
   if (!r.order_date && !reqShown && !si) return "";
   return `<div class="sec">Order details</div>

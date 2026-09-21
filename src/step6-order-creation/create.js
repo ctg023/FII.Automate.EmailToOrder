@@ -41,6 +41,9 @@ export async function resolveCompany() {
 }
 
 const isISO = (s) => /^\d{4}-\d{2}-\d{2}/.test(s || "");
+// Local (order-entry) date as YYYY-MM-DD — the day filled on the line when stock is
+// available, so the confirmation shows it. Local, not UTC, to avoid a near-midnight skew.
+const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
 const unwrap = (j) => (j && j.extraction ? j.extraction : j);
 
 // Numbering is owned entirely by BC: the "Email Order No. Series" AL subscriber
@@ -68,10 +71,18 @@ function buildDoc(order, res) {
   const header = { customerNumber: res.rule1.match?.number };
   if (order.po_number) header.externalDocumentNumber = String(order.po_number).slice(0, 35);
   // Sales orders use `orderDate`; sales quotes use `documentDate`.
-  const dateField = res.disposition === "order" ? "orderDate" : "documentDate";
+  const isOrder = res.disposition === "order";
+  const dateField = isOrder ? "orderDate" : "documentDate";
   if (isISO(order.order_date)) header[dateField] = order.order_date.slice(0, 10);
-  // requestedDeliveryDate exists on salesOrder only — salesQuote 400s on it.
-  if (res.disposition === "order" && isISO(order.requested_ship_date)) header.requestedDeliveryDate = order.requested_ship_date.slice(0, 10);
+  // Requested delivery date (General fast tab): the PO's requested/required date, else
+  // TODAY's order-entry date (the day the line ships when stock is available). Order only
+  // — salesQuote 400s on requestedDeliveryDate. The line Shipment Date (Shipping & Billing)
+  // is set to MATCH below (the API doesn't expose the header Shipment Date).
+  let delivery = null;
+  if (isOrder) {
+    delivery = isISO(order.requested_ship_date) ? order.requested_ship_date.slice(0, 10) : todayISO();
+    header.requestedDeliveryDate = delivery;
+  }
   // Ship-to + contact from the matched BC records (Rules 4 & 5), so the doc uses the
   // address/contact on file rather than re-typed values.
   const s = res.shipTo?.shipTo;
@@ -85,7 +96,11 @@ function buildDoc(order, res) {
   }
   if (res.contact?.contact?.name) header.shipToContact = res.contact.contact.name;
   const lines = res.lines
-    .map((l, i) => ({ lineType: "Item", lineObjectNumber: l.item, quantity: order.line_items?.[i]?.quantity }))
+    .map((l, i) => {
+      const ln = { lineType: "Item", lineObjectNumber: l.item, quantity: order.line_items?.[i]?.quantity };
+      if (delivery) ln.shipmentDate = delivery; // Shipment Date matches the requested delivery date
+      return ln;
+    })
     .filter((l) => l.lineObjectNumber && l.quantity != null);
   const ent = res.disposition === "order" ? "salesOrders" : "salesQuotes";
   const lineEnt = res.disposition === "order" ? "salesOrderLines" : "salesQuoteLines";

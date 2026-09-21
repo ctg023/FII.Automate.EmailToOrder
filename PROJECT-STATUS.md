@@ -21,9 +21,10 @@ Live-backlog hardening from working real orders in the review app:
 - **Quantity-increment gate** (verify.js) — piece quantities must be whole multiples of **100** (fasteners
   ship in hundreds); a non-multiple (e.g. 120, 2120, 2150) routes the order to review. Tune/disable via
   `QTY_STEP`. (Applies only to piece quantities; non-piece UoM is already flagged separately.)
-- **Order dates + special instructions** surfaced on each card; requested/ship date **falls back to the 1st
-  email date** when the PO states none (and populates on the created BC order). Line item shows **✕** (not a
-  green ✓) when a qty/UoM/price problem blocks creation.
+- **Order dates + special instructions** surfaced on each card. On create, the **Requested Delivery Date**
+  (General fast tab) = the PO's requested/required date, else **today's order-entry date**; the **line
+  Shipment Date** (Shipping & Billing) is set to **match** (the standard API doesn't expose a header Shipment
+  Date, so it's set per line). Line item shows **✕** (not a green ✓) when a qty/UoM/price problem blocks creation.
 - **Mailbox reconcile — auto-drop handled orders** — a card whose **source email is no longer in the Inbox**
   (deleted or moved out = a rep processed it outside the app) is removed from the queue. Read-only against the
   mailbox: checks each cached message by id, and — since Graph **default message ids can rotate** — CONFIRMS an

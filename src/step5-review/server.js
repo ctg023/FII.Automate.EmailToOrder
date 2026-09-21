@@ -20,7 +20,7 @@ import { spawn } from "node:child_process";
 import { createDoc } from "../step6-order-creation/create.js";
 import { verifyOrder, searchCustomers } from "../step4-bc-verification/verify.js";
 import { setAlias } from "./aliases.js";
-import { page, firstEmailDate } from "./render.js";
+import { page } from "./render.js";
 import { bcqNumbers } from "./thread-merge.js";
 
 const PORT = Number(process.env.REVIEW_PORT || 8787);
@@ -45,11 +45,11 @@ const loadStore = () => { try { return JSON.parse(readFileSync(STORE, "utf8")); 
 const saveStore = (s) => { import("node:fs").then(({ writeFileSync }) => writeFileSync(STORE, JSON.stringify(s, null, 2))); };
 
 // Rebuild the extracted-order shape (Step-2) from a stored review record. When the PO
-// stated no requested/ship date, fall back to the 1st email date so the created BC doc
-// still gets a requested delivery date populated.
+// stated no requested/ship date, create.js fills TODAY's order-entry date (and sets the
+// line Shipment Date to match) — so pass the requested date through as-is here.
 const orderFromRecord = (rec) => ({
   customer: rec.customer, po_number: rec.po_number, order_date: rec.order_date,
-  requested_ship_date: (rec.requested_ship_date && String(rec.requested_ship_date).trim()) || firstEmailDate(rec),
+  requested_ship_date: rec.requested_ship_date,
   ship_to: rec.ship_to, line_items: rec.line_items,
   special_instructions: rec.special_instructions,
   quote_refs: rec.quote_refs?.length ? rec.quote_refs : [...new Set((rec.conversation || []).flatMap((m) => bcqNumbers(m.subject || "")))],
