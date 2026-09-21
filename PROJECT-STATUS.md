@@ -1,6 +1,23 @@
 # Project status — Orders@ → Business Central automation
 
-_Last updated: 2026-09-17_
+_Last updated: 2026-09-21_
+
+## Recent changes (2026-09-21)
+Live-backlog hardening from working real orders in the review app:
+- **Forwarded-as-email POs handled** (ingestion) — senders like **Bunn** attach the PO as an *email*
+  (Graph `itemAttachment`, message/rfc822) with the real PDF nested inside. `mailbox.js`
+  (`fetchItemAttachmentFiles`, nested `$expand`) now recovers those PDFs so they reach extraction.
+- **Thread merging** (`src/step5-review/thread-merge.js`) — a PO split across conversations (customer
+  `Re:` + internal `FW:`) now merges into ONE card by subject keys (**BC/Q number** or a **guarded PO
+  token**). **Cache-aware** (matches cards whose other half left the pull window; `fetchThreadByIds`).
+  **ON** via `MERGE_THREADS=1`; free preview with `pipeline.js --merge-preview`. Caught 4 split POs
+  (e.g. P/O 287921 — PO PDF + signed print were on separate cards).
+- **Part-matching fallbacks** (verify.js, Rule 2) for messy part fields — **part-field prefix**
+  (`HS3 M6 PROJECTION WELD NUT`→`HS3 M6`) and **description-anchored** (`RW2114OHIO`→`RW-2114` from the
+  description). Both require a unique BC match. Recovered several backlog orders from review→order/quote.
+- **Assign re-scans Rules 4 & 5** — changing a customer in the app (`/api/assign`) now updates the
+  **Ship-To / Contact** panels for the new customer (previously left stale, so a matched customer could
+  still show a red ship-to/contact from the pre-change verify).
 
 ## Where we are
 Working through the brief's build order. **Steps 1–3 done. Step 4 in progress:** BC connectivity

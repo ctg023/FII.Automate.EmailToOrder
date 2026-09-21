@@ -18,7 +18,10 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
 - **Step 3 (classification):** done — harness in `src/step3-classification/`; 92%, **0 dropped orders**.
 - **Step 4 (BC verification):** done (read-only) — `src/step4-bc-verification/verify.js` assigns a
   **disposition** (Order / Quote / Needs-review). Rules: **1** customer name match · **2** line items
-  (direct / cross-ref via `Item_References_Excel`) · **3** stock · **4** ship-to matches a `ShipTo` on file
+  (direct / cross-ref via `Item_References_Excel`, then two fallbacks for messy part fields —
+  **part-field prefix**: real part + crammed description words, e.g. `HS3 M6 PROJECTION WELD NUT`→`HS3 M6`;
+  and **description-anchored**: clean part in the description when the part field carries a tag, e.g.
+  `RW2114OHIO`→`RW-2114`; both require a unique BC match) · **3** stock · **4** ship-to matches a `ShipTo` on file
   (hard gate) · **5** contact/email matches a Person contact under the customer's company contact
   (`Contact`/`ContactBusinessRelation`; **informational unless `CONTACT_GATE=1`**). Also gates: non-piece
   **UoM** (100PACK/M/C → review) and **multi-PO-in-one-email** → review. `--batch <dir> --json <out>` emits records.
@@ -26,6 +29,11 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   - `pipeline.js` — live runner: pulls `order@` Inbox, groups messages into **threads by conversationId**
     (Inbox-only — reps reply from their own mailboxes, so Sent isn't captured), classify→extract(w/ PDFs)→
     verify, **incremental cache** in `out/review-store.json`. Model defaults to **Sonnet 5**. Non-orders hidden.
+  - **Thread merging** (`src/step5-review/thread-merge.js`): one PO's paperwork often arrives under multiple
+    conversationIds (customer `Re:` + internal `FW:`). Merges them into ONE card by subject keys (**BC/Q number**
+    or a **guarded PO token**), keeping the thread shape so downstream is unchanged. **Cache-aware** — matches a
+    fresh thread against cached cards whose other half scrolled out of the pull window (`fetchThreadByIds`).
+    **ON** via `MERGE_THREADS=1` in `.env`; preview (no changes) with `pipeline.js --merge-preview`.
   - `render.js` — renders the queue; interactive mode wires the buttons.
   - `server.js` — Node service serving the live page. **Approve = dry-run preview → INLINE confirm →
     guarded create** to BC260TEST/Fasteners (writes a real Sales Order/Quote). Created docs are marked
@@ -34,15 +42,19 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   - **Customer fix-up:** unmatched (or wrong) customers get suggestions + a **BC customer search** + a
     **change** link on matched cards; every pick is saved as a **learned alias** (`src/step5-review/aliases.js`,
     `data/`, keyed by email domain + name) consulted *before* name-matching, so recurring customers stop
-    needing review. Created orders set the matched **ship-to address + contact** on the BC doc.
-  - Commands: `pipeline.js --run` (process new mail) · `--reverify` (re-apply rules to cache, no Claude) ·
-    `--enrich` (dup-check + save PDFs) · `--reconcile` · `--rerender`. `server.js` serves the app.
+    needing review. Created orders set the matched **ship-to address + contact** on the BC doc. Changing the
+    customer (`/api/assign`) **re-scans Rules 4 & 5** and updates the Ship-To / Contact panels for the new customer.
+  - Commands: `pipeline.js --run` (process new mail) · `--merge-preview` (show split-PO merges, free) ·
+    `--reverify` (re-apply rules to cache, no Claude) · `--enrich` (dup-check + save PDFs) · `--reconcile` ·
+    `--rerender`. `server.js` serves the app.
 - **Step 6 (order creation):** write **proven** — `src/step6-order-creation/create.js`; `createDoc()` is the
   programmatic path the server calls. Dry-run default; guarded real write. ⚠️ BC assigns a **default** number
   series until the `EMAILORDER` No.-Series **AL codeunit is deployed** (developer task — then S-ORD-EMAIL/S-QUO-EMAIL).
 - **Ingestion (Track A):** **LIVE** — Entra app + `.env` done; `mailbox.js --check` green; reads
-  `order@buckeyefasteners.com` (singular). ⚠️ **Application Access Policy fence NOT yet applied** (app can read
-  ALL mailboxes) — must do before pilot.
+  `order@buckeyefasteners.com` (singular). Handles **forwarded-as-email POs** (e.g. Bunn) — a Graph
+  `itemAttachment` (message/rfc822) whose real PDF is nested one level down is pulled via a nested `$expand`
+  (`fetchItemAttachmentFiles`), so those PDFs reach extraction. ⚠️ **Application Access Policy fence NOT yet
+  applied** (app can read ALL mailboxes) — must do before pilot.
 - Accuracy pass **done** (found+fixed UoM, multi-PO, PDF-folder collision). Live backlog processed (full 188
   Inbox → ~85 real orders). **Open decisions:** (1) enable `CONTACT_GATE=1`? (works now; email match needs
   prod) (2) build the **mailbox move-on-approve** cleanup (needs `Mail.ReadWrite`)? (3) server **auth**,
@@ -64,7 +76,8 @@ src/step2-extraction/     # extraction harness (schema.js, extract.js, score.js,
 src/step3-classification/ # order/not_order/unsure classifier (same shape)
 src/step4-bc-verification/# ping.js (connectivity), data-quality.js, verify.js (read-only rules + disposition)
 src/step5-review/         # LIVE review app: pipeline.js (ingest→classify→extract→verify→cache),
-                          #   render.js (page), server.js (serves page + approve/preview/refresh endpoints)
+                          #   render.js (page), server.js (serves page + approve/preview/refresh endpoints),
+                          #   thread-merge.js (fold split-PO threads into one card; MERGE_THREADS=1)
 src/step6-order-creation/ # create.js = BC Sales Order / Quote write; createDoc()/docExists() exported for server
 bc-extension/             # AL codeunit + README for the EMAILORDER number series (developer handoff)
 docs/                     # Email-Order-Review-Guide.pdf (rep-facing user guide)
@@ -93,6 +106,7 @@ node src/step4-bc-verification/verify.js --batch samples/answer-keys --json out/
 node src/step5-review/render.js --in out/verified.json --out out/review.html
 # LIVE review app (reads order@; writes to BC only on human Approve):
 node src/step5-review/pipeline.js --threads              # FREE: pull + group live threads
+node src/step5-review/pipeline.js --merge-preview        # FREE: show which split-PO threads would merge
 node src/step5-review/pipeline.js --estimate --limit 3   # cost projection for new threads
 node src/step5-review/pipeline.js --run [--limit N]      # classify+extract+verify new threads (Sonnet)
 node src/step5-review/pipeline.js --reconcile            # return BC-deleted orders to the queue
