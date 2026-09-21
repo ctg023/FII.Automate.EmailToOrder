@@ -218,6 +218,32 @@ function vendorPartFromDesc(desc) {
   return m ? m[1].trim() : null;
 }
 
+// The customer's part FIELD can carry a trailing tag (e.g. Hatfield's "RW2114OHIO" =
+// part + plant code) while the clean part sits in the DESCRIPTION ("RW-2114 Buckeye
+// Fastener"). Mine part-like tokens from the description, ordered by confidence:
+//   • ANCHORED — the token's normalized form appears inside a part field (so the
+//     field is the real part wrapped in the customer's own prefix/suffix codes, e.g.
+//     "RW2114OHIO", "XOHOPC1220HWZ"). High confidence; tried first.
+//   • LEADING — the first part-like token in the description. Weaker; best-effort.
+// A token qualifies as part-like only if, normalized, it is >=4 chars and has a digit.
+// Callers still require a UNIQUE BC item match, so this never guesses among several.
+function descPartCandidates(description, partFields = []) {
+  const raw = String(description || "").split(/[\s,;()\[\]]+/).filter(Boolean);
+  const fields = partFields.map((f) => normPart(f || "")).filter(Boolean);
+  const seen = new Set();
+  const anchored = [], leading = [];
+  let sawLead = false;
+  for (const tok of raw) {
+    const n = normPart(tok);
+    if (n.length < 4 || !/\d/.test(n)) continue; // must look like a part number
+    const first = !sawLead; sawLead = true;
+    if (seen.has(n)) continue; seen.add(n);
+    if (fields.some((f) => f.length > n.length && f.includes(n))) anchored.push(tok);
+    else if (first) leading.push(tok);
+  }
+  return [...anchored, ...leading];
+}
+
 // Item index: our whole item master, keyed by BOTH the slash-kept and slash-removed
 // normalized forms, so a part matches whether or not the slash is present, while the
 // slash stays real for the item that has one. Loaded once, cached for the process.
@@ -313,6 +339,16 @@ async function checkLine(company, line, custNo) {
       via = "cross-ref";
     } else if (cr.items.length > 1) {
       return { label, pass: false, rule2: false, detail: `customer part "${customer}" cross-refs to ${cr.items.length} items (${cr.items.slice(0, 4).join(", ")}) — ambiguous` };
+    }
+  }
+
+  // Rule 2, path (c) DESCRIPTION-ANCHORED — clean part in the description when the
+  // part field carries a trailing tag (e.g. "RW2114OHIO" -> description "RW-2114").
+  if (!item) {
+    for (const pn of descPartCandidates(line.description, [supplier, customer])) {
+      const r = await resolveItem(company, pn);
+      if (r.item) { item = r.item; via = `description part "${pn}"`; break; }
+      // ambiguous -> skip (never guess among several)
     }
   }
 
