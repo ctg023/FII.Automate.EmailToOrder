@@ -29,7 +29,12 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   it, `Sales_Order_Excel` by **`Quote_No`**+`…SalesLines`), then compare each item's price to the PO's (exact
   by default; `PRICE_TOL` per-unit $ tolerance); mismatch → review. NB: the **standard `salesQuotes` API has no
   usable No./lines** — use the classic pages. A referenced quote not in the current instance (some live only in
-  **prod**) is reported, not gated.
+  **prod**) is reported, not gated. · **7** **plating/finish substitution** — customers order the BASE item
+  and ask (in the line text/notes) for a finish, which is a different item `base-P##`. Detects the request,
+  reads the authoritative **`ARC_Plating_Desc`** off the classic `Item_Card_Excel`, and **swaps in the plated
+  item number** (e.g. "black oxide" → `SSM 05014-P44`, "copper flash" → `-P40`, "zinc yellow" → `-P17`).
+  "plain / no plate" keeps the base; **bare "zinc"** (several zinc variants) or any unresolved finish → review
+  with candidate variants. Explicit `-P##` on the PO is used directly.
   Also gates: non-piece **UoM** (100PACK/M/C → review), **piece quantity not a multiple of 100** (fasteners
   ship in hundreds; e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), and **multi-PO-in-one-email** →
   review. `--batch <dir> --json <out>` emits records.

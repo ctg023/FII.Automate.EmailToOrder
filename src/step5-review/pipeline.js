@@ -388,7 +388,7 @@ async function cmdReverify() {
   console.log(`Re-verifying ${targets.length} cached order(s) against BC (no Claude)…\n`);
   for (const x of targets) {
     const r = x.record;
-    const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items, quote_refs: quoteRefsFromRecord(r) };
+    const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items, special_instructions: r.special_instructions, quote_refs: quoteRefsFromRecord(r) };
     try {
       const { res, assigned } = await verifyWithAlias(order, r.customer_assigned);
       const was = x.disposition;

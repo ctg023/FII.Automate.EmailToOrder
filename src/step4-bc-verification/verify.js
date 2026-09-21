@@ -339,8 +339,66 @@ const QTY_STEP = Number(process.env.QTY_STEP || 100);
 const qtyNeedsReview = (qty, uomFlag) =>
   !uomFlag && QTY_STEP > 1 && Number.isFinite(qty) && qty > 0 && qty % QTY_STEP !== 0;
 
+// --- Plating substitution ----------------------------------------------------
+// Customers often order the BASE item number and ask (in the line text / notes) for a
+// finish; the plated finish is a DIFFERENT item, base + "-P##" (e.g. SSM 05014 ->
+// SSM 05014-P44 for black oxide). The authoritative finish per item is the classic
+// Item_Card_Excel field ARC_Plating_Desc. We detect a plating request, resolve it to a
+// single plated variant, and swap the item number — or FLAG to review when unsure
+// (e.g. bare "zinc" with several zinc variants), never guessing.
+const PLATING_TERMS = /\b(plat(e|ed|ing)?|zinc|oxide|chromate|chrome|nickel|phosphat\w*|trivalent|cadmium|cad|galvaniz\w*|passivat\w*|copper|tin|electroplat\w*|black ?ox\w*|yellow|dacromet|geomet|xylan)\b/i;
+const PLATING_NEGATION = /\b(no (zinc|plat\w*|finish|coat\w*)|plain finish|unplated|bare|no plate)\b/i;
+const FINISH_WORDS = new Set(["zinc", "black", "oxide", "yellow", "clear", "trivalent", "copper", "flash", "nickel", "tin", "phosphate", "cadmium", "galvanized", "chrome", "chromate", "blue", "olive", "silver"]);
+// Reduce a plating string (customer text or ARC_Plating_Desc) to comparable finish tokens.
+function platingTokens(s) {
+  const syn = { blk: "black", ox: "oxide", yellw: "yellow", yel: "yellow", trival: "trivalent", triv: "trivalent", galv: "galvanized", cad: "cadmium", ni: "nickel", cu: "copper", electroplate: "zinc", electroplated: "zinc" };
+  const out = new Set();
+  for (let t of String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").split(" ")) {
+    if (!t) continue;
+    t = syn[t] || t;
+    if (FINISH_WORDS.has(t)) out.add(t);
+  }
+  return out;
+}
+// Detect a plating request for a line (from its description + order-level notes).
+function requestedPlating(line, notes) {
+  const text = `${line.description || ""}  ${notes || ""}`;
+  if (PLATING_NEGATION.test(text)) return { none: true };            // "plain / no plate" -> keep base
+  const suf = text.match(/-\s*P\s*(\d{1,3})\b/i);                    // explicit "-P44"
+  if (suf) return { suffix: `-P${suf[1]}` };
+  const tokens = platingTokens(text);
+  if (!PLATING_TERMS.test(text) || !tokens.size) return null;
+  return { tokens };
+}
+// The base item's plated variants, with their authoritative ARC_Plating_Desc.
+async function platedVariants(company, baseNo) {
+  const C = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const r = await get(encodeURI(`${C}/Item_Card_Excel?$filter=startswith(No,${odataStr(baseNo + "-P")})&$select=No,ARC_Plating_Desc,Description`));
+  return (r.json?.value || []).map((v) => ({ no: v.No, plating: v.ARC_Plating_Desc || "", desc: v.Description || "" }));
+}
+// Resolve a plating request to ONE plated variant. -> { item } | { item:null, note, candidates }
+async function resolvePlated(company, baseNo, req) {
+  const variants = await platedVariants(company, baseNo);
+  if (!variants.length) return { item: null, note: `plating requested but no plated variants of ${baseNo} exist in BC` };
+  // (1) explicit -P## the customer wrote
+  if (req.suffix) {
+    const v = variants.find((x) => stripSD(x.no).endsWith(stripSD(baseNo + req.suffix)));
+    if (v) return { item: (await resolveItem(company, v.no)).item, note: `plated: ${baseNo} → ${v.no} (${v.plating || req.suffix})` };
+    return { item: null, note: `PO cites ${req.suffix} but ${baseNo}${req.suffix} isn't in BC`, candidates: variants };
+  }
+  // (2) bare "zinc" with no qualifier is ambiguous -> review (per decision)
+  const want = req.tokens;
+  const isGenericZinc = want.size === 1 && want.has("zinc");
+  // candidates = variants whose finish tokens cover everything the customer asked for
+  const cands = variants.filter((v) => { const vt = platingTokens(`${v.plating} ${v.desc}`); return [...want].every((t) => vt.has(t)); });
+  if (isGenericZinc) return { item: null, note: `"zinc" is ambiguous — pick the exact zinc finish`, candidates: cands.length ? cands : variants };
+  if (cands.length === 1) { const it = (await resolveItem(company, cands[0].no)).item; return { item: it, note: `plated: ${baseNo} → ${cands[0].no} (${cands[0].plating || cands[0].desc})` }; }
+  if (cands.length > 1) return { item: null, note: `plating "${[...want].join(" ")}" matches ${cands.length} variants — pick one`, candidates: cands };
+  return { item: null, note: `plating "${[...want].join(" ")}" didn't match a plated variant of ${baseNo}`, candidates: variants };
+}
+
 // Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then inventory.
-async function checkLine(company, line, custNo) {
+async function checkLine(company, line, custNo, notes) {
   const supplier = (line.supplier_part || "").trim();
   const customer = (line.customer_part || "").trim();
   const qty = line.quantity;
@@ -395,6 +453,17 @@ async function checkLine(company, line, custNo) {
     };
   }
 
+  // Plating: base item + a requested finish -> swap in the plated variant (or flag).
+  let platingNote = null, platingFlag = false, platingCandidates = null;
+  if (!/-P\d+$/i.test(item.number)) {
+    const req = requestedPlating(line, notes);
+    if (req && !req.none) {
+      const pr = await resolvePlated(company, item.number, req);
+      if (pr.item) { item = pr.item; via = `${via} +plating`; platingNote = pr.note; }
+      else { platingFlag = true; platingNote = pr.note; platingCandidates = (pr.candidates || []).slice(0, 6).map((c) => ({ no: c.no, plating: c.plating })); }
+    }
+  }
+
   // Rule 3 — inventory >= quantity ordered.
   if (qty == null) {
     return { label, pass: false, rule2: true, item: item.number, detail: `resolved to ${item.number} (via ${via}) but order has no quantity to verify` };
@@ -409,9 +478,10 @@ async function checkLine(company, line, custNo) {
   const qtyNote = qtyFlag
     ? ` [⚠ quantity ${qty} is not a multiple of ${QTY_STEP} pieces — confirm before creating]`
     : "";
+  const platingText = platingNote ? ` [${platingFlag ? "⚠ " : ""}${platingNote}]` : "";
   return {
-    label, pass: enough, rule2: true, item: item.number, via, uomFlag, qtyFlag,
-    detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}`,
+    label, pass: enough, rule2: true, item: item.number, via, uomFlag, qtyFlag, platingFlag, platingNote, platingCandidates,
+    detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}${platingText}`,
   };
 }
 
@@ -594,7 +664,8 @@ export async function verifyOrder(order, opts = {}) {
   }
   const custNo = r1.match?.number || null; // resolved customer #, sharpens cross-ref
   const lines = [];
-  for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo));
+  const orderNotes = order.notes ?? order.special_instructions ?? "";
+  for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo, orderNotes));
 
   // Rule 6 — price match against the referenced BC quote (exact by default). Sets
   // per-line priceFlag/priceNote; a mismatch gates to review below.
@@ -609,6 +680,7 @@ export async function verifyOrder(order, opts = {}) {
   const gateParts = lines.length > 0 && lines.every((l) => l.rule2);
   const uomIssue = lines.some((l) => l.uomFlag); // non-piece unit -> qty not safe to auto-create
   const qtyIssue = lines.some((l) => l.qtyFlag); // piece qty not a multiple of QTY_STEP (e.g. 2120)
+  const platingIssue = lines.some((l) => l.platingFlag); // plating requested but not resolved to one variant
   const priceIssue = priceRes.checked && priceRes.mismatches > 0; // PO price != referenced quote
   const allInStock = gateParts && lines.every((l) => l.pass);
   const multiPO = multiplePOs(order.po_number); // one email carrying 2+ POs
@@ -631,6 +703,10 @@ export async function verifyOrder(order, opts = {}) {
     disposition = "review";
     const bad = lines.filter((l) => l.qtyFlag);
     dispositionReason = `${bad.length} line(s) have a quantity that is not a multiple of ${QTY_STEP} pieces (${bad.map((l) => l.label).slice(0, 3).join(", ")}) — confirm the quantity before creating`;
+  } else if (platingIssue) {
+    disposition = "review";
+    const p = lines.find((l) => l.platingFlag);
+    dispositionReason = `plating/finish needs a pick — ${p?.platingNote || "couldn't resolve the requested finish to one BC item"}`;
   } else if (priceIssue) {
     disposition = "review";
     dispositionReason = `${priceRes.mismatches} line(s) priced differently from the referenced quote (BC/Q ${priceRes.quotes.join(", ")}) — confirm the price before creating`;

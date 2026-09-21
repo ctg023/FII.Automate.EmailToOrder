@@ -51,6 +51,7 @@ const orderFromRecord = (rec) => ({
   customer: rec.customer, po_number: rec.po_number, order_date: rec.order_date,
   requested_ship_date: (rec.requested_ship_date && String(rec.requested_ship_date).trim()) || firstEmailDate(rec),
   ship_to: rec.ship_to, line_items: rec.line_items,
+  special_instructions: rec.special_instructions,
   quote_refs: rec.quote_refs?.length ? rec.quote_refs : [...new Set((rec.conversation || []).flatMap((m) => bcqNumbers(m.subject || "")))],
 });
 

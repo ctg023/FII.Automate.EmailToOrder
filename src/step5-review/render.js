@@ -47,7 +47,7 @@ function suggestionBtn(s) {
 // in stock, AND no blocking quantity/UoM problem. A resolved+in-stock line whose
 // quantity isn't safe to create (not a multiple of 100, or a multiplier UoM) shows ✕.
 function lineRow(l) {
-  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag;
+  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag && !l.platingFlag;
   const state = ok ? "ok" : "bad";
   const mark = ok ? "✓" : l.rule2 ? "✕" : "!";
   const priceNote = l.priceNote ? `<div class="sub">${l.priceFlag ? "⚠ " : ""}${esc(l.priceNote)}</div>` : "";

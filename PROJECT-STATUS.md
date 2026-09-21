@@ -24,6 +24,12 @@ Live-backlog hardening from working real orders in the review app:
 - **Order dates + special instructions** surfaced on each card; requested/ship date **falls back to the 1st
   email date** when the PO states none (and populates on the created BC order). Line item shows **✕** (not a
   green ✓) when a qty/UoM/price problem blocks creation.
+- **Plating / finish substitution (Rule 7)** — customers order the BASE item and request a finish in the line
+  text/notes; the plated finish is a different item (`base-P##`). The tool detects the request, reads the
+  authoritative **`ARC_Plating_Desc`** off the classic `Item_Card_Excel` page, and **swaps in the plated item
+  number** (validated live on the SSM 05014 family: black oxide→P44, copper flash→P40, zinc yellow / trivalent
+  →P17). **"plain / no plate" keeps the base**; **bare "zinc"** (several zinc variants) or any finish that
+  doesn't resolve to exactly one variant → **review** with the candidate variants. Explicit `-P##` used directly.
 - **Price match vs referenced quote (Rule 6)** — extract the **BC/Q #** from the subject and compare each
   item's price to the referenced quote (**exact** by default, `PRICE_TOL` to loosen); mismatch → review.
   **Data source = classic OData pages** (the standard `salesQuotes` API has no usable No./lines): open quote via
