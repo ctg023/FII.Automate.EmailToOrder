@@ -43,10 +43,13 @@ function suggestionBtn(s) {
   return `<button class="sugg" data-act="assign" data-cust="${esc(s.number)}" data-name="${esc(s.displayName)}"><b>${esc(s.displayName)}</b><span class="sm">${bits.join(" · ")}</span></button>`;
 }
 
-// One line-item check row (dot state from pass / rule2).
+// One line-item check row. Green ✓ only when the line is genuinely ready: resolved,
+// in stock, AND no blocking quantity/UoM problem. A resolved+in-stock line whose
+// quantity isn't safe to create (not a multiple of 100, or a multiplier UoM) shows ✕.
 function lineRow(l) {
-  const state = l.pass ? "ok" : "bad";
-  const mark = l.pass ? "✓" : l.rule2 ? "✕" : "!";
+  const ok = l.pass && !l.qtyFlag && !l.uomFlag;
+  const state = ok ? "ok" : "bad";
+  const mark = ok ? "✓" : l.rule2 ? "✕" : "!";
   return `<div class="check">
       <span class="dot ${state}">${mark}</span>
       <div class="txt">
