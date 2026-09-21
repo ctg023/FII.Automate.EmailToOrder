@@ -52,6 +52,7 @@ const orderFromRecord = (rec) => ({
   requested_ship_date: rec.requested_ship_date,
   ship_to: rec.ship_to, line_items: rec.line_items,
   special_instructions: rec.special_instructions,
+  service_action_required: rec.service_action_required, service_action_reason: rec.service_action_reason,
   quote_refs: rec.quote_refs?.length ? rec.quote_refs : [...new Set((rec.conversation || []).flatMap((m) => bcqNumbers(m.subject || "")))],
 });
 
@@ -146,6 +147,10 @@ async function handle(req, res) {
       // the stale pre-change result.
       r.shipTo = res2.shipTo; r.contact = res2.contact;
       r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
+      // Re-derived overlays for the newly-assigned customer (payment gate, high-value, blocked).
+      r.paymentReview = res2.paymentReview;
+      r.requiresApproval = res2.requiresApproval; r.approvalReason = res2.approvalReason;
+      r.orderTotal = res2.orderTotal; r.threshold = res2.threshold; r.blockedLines = res2.blockedLines;
       r.customer_assigned = { number: customerNumber, name: customerName };
       saveStore(store);
       // Learn from the pick: future emails from this customer (domain/name) auto-resolve.

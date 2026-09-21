@@ -41,6 +41,14 @@ const REVIEW_OVER = Number(process.env.REVIEW_OVER || 5000);
 // REVIEW_NO_PRICE=0 to disable (e.g. if most POs price only on the referenced quote).
 const REVIEW_NO_PRICE = process.env.REVIEW_NO_PRICE !== "0";
 
+// Payment-based review gates (hard review — not creatable). A resolved customer whose
+// BC Payment TERMS code is in REVIEW_TERMS_CODES (prepay) or whose Payment METHOD code
+// is in REVIEW_METHOD_CODES (terms + bank fee) routes to review: these orders need a
+// human before creation. Codes are matched case-insensitively; tune via .env.
+const csvSet = (s) => new Set(String(s || "").split(",").map((x) => x.trim().toUpperCase()).filter(Boolean));
+const REVIEW_TERMS_CODES = csvSet(process.env.REVIEW_TERMS_CODES || "PREPAY");
+const REVIEW_METHOD_CODES = csvSet(process.env.REVIEW_METHOD_CODES || "TERMS+FEE");
+
 async function get(pathOrUrl) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${BASE}/${pathOrUrl}`;
   const res = await fetch(url, { headers: { Authorization: AUTH, Accept: "application/json" } });
@@ -422,7 +430,29 @@ async function resolvePlated(company, baseNo, req) {
   return { item: null, note: `plating "${[...want].join(" ")}" didn't match a plated variant of ${baseNo}`, candidates: variants };
 }
 
-// Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then inventory.
+// Available-to-sell for an item = on-hand Inventory − Qty on Sales Order (quantity
+// already committed to other open sales orders). The standard API `items` exposes only
+// on-hand; the classic Item_Card_Excel page exposes both FlowFields, read together so
+// they're a single snapshot. Cached briefly (items resolve repeatedly across a batch);
+// the server re-verifies per request so approve-time numbers stay fresh. On a read miss
+// we fall back to the standard on-hand with 0 committed (never worse than before).
+const AVAIL_TTL = Number(process.env.AVAIL_TTL_MS || 60000);
+const AVAIL_CACHE = new Map(); // itemNo(upper) -> { at, onHand, onSalesOrder, available, found }
+async function availabilityOf(company, itemNo, fallbackOnHand = 0) {
+  const key = String(itemNo).toUpperCase();
+  const hit = AVAIL_CACHE.get(key);
+  if (hit && Date.now() - hit.at < AVAIL_TTL) return hit;
+  const C = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const r = await get(encodeURI(`${C}/Item_Card_Excel?$filter=No eq ${odataStr(itemNo)}&$select=No,Inventory,Qty_on_Sales_Order`));
+  const row = r.ok ? r.json?.value?.[0] : null;
+  const onHand = row ? Number(row.Inventory ?? 0) : Number(fallbackOnHand ?? 0);
+  const onSalesOrder = row ? Number(row.Qty_on_Sales_Order ?? 0) : 0;
+  const rec = { at: Date.now(), onHand, onSalesOrder, available: onHand - onSalesOrder, found: !!row };
+  AVAIL_CACHE.set(key, rec);
+  return rec;
+}
+
+// Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then availability.
 async function checkLine(company, line, custNo, notes) {
   const supplier = (line.supplier_part || "").trim();
   const customer = (line.customer_part || "").trim();
@@ -495,12 +525,13 @@ async function checkLine(company, line, custNo, notes) {
   const blockedFlag = item.blocked === true;
   const blockedText = blockedFlag ? ` [⛔ item ${item.number} is BLOCKED in BC — this line is excluded from the created doc]` : "";
 
-  // Rule 3 — inventory >= quantity ordered.
+  // Rule 3 — AVAILABLE (on-hand − qty on sales order) >= quantity ordered.
   if (qty == null) {
     return { label, pass: false, rule2: true, item: item.number, blockedFlag, detail: `resolved to ${item.number} (via ${via}) but order has no quantity to verify${blockedText}` };
   }
-  const onHand = Number(item.inventory ?? 0);
-  const enough = onHand >= qty;
+  const av = await availabilityOf(company, item.number, item.inventory);
+  const onHand = av.onHand, onOrder = av.onSalesOrder, available = av.available;
+  const enough = available >= qty;
   const uomFlag = uomNeedsReview(line.uom, item.baseUnitOfMeasureCode);
   const qtyFlag = qtyNeedsReview(qty, uomFlag);
   const uomNote = uomFlag
@@ -512,7 +543,8 @@ async function checkLine(company, line, custNo, notes) {
   const platingText = platingNote ? ` [${platingFlag ? "⚠ " : ""}${platingNote}]` : "";
   return {
     label, pass: enough, rule2: true, item: item.number, via, uomFlag, qtyFlag, platingFlag, platingNote, platingCandidates, blockedFlag,
-    detail: `${item.number} (via ${via}) — on-hand ${onHand} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}${platingText}${blockedText}`,
+    onHand, onOrder, available,
+    detail: `${item.number} (via ${via}) — available ${available} (on-hand ${onHand} − on-order ${onOrder}) vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}${platingText}${blockedText}`,
   };
 }
 
@@ -590,10 +622,46 @@ async function checkContact(company, order, custNo) {
 let CUST_LIST = null, CUST_LIST_AT = 0;
 async function allCustomers(company) {
   if (CUST_LIST && Date.now() - CUST_LIST_AT < 10 * 60 * 1000) return CUST_LIST;
-  const res = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,city,state,blocked`);
+  const res = await getAll(`companies(${company.id})/customers?$select=number,displayName,email,city,state,blocked,paymentTermsId,paymentMethodId`);
   if (!res.ok) throw new Error(`customers read -> HTTP ${res.status}`);
   CUST_LIST = res.rows; CUST_LIST_AT = Date.now();
   return CUST_LIST;
+}
+
+// id -> CODE maps for the Payment Terms and Payment Method tables (the customer record
+// stores only the GUID ids). Small tables; cached 10 min like the customer list.
+let PT_MAP = null, PT_AT = 0, PM_MAP = null, PM_AT = 0;
+async function paymentTermsMap(company) {
+  if (PT_MAP && Date.now() - PT_AT < 10 * 60 * 1000) return PT_MAP;
+  const r = await get(`companies(${company.id})/paymentTerms?$select=id,code`);
+  PT_MAP = new Map((r.json?.value || []).map((t) => [t.id, (t.code || "").toUpperCase()]));
+  PT_AT = Date.now();
+  return PT_MAP;
+}
+async function paymentMethodsMap(company) {
+  if (PM_MAP && Date.now() - PM_AT < 10 * 60 * 1000) return PM_MAP;
+  const r = await get(`companies(${company.id})/paymentMethods?$select=id,code`);
+  PM_MAP = new Map((r.json?.value || []).map((m) => [m.id, (m.code || "").toUpperCase()]));
+  PM_AT = Date.now();
+  return PM_MAP;
+}
+
+// Payment-terms / payment-method review gate for a RESOLVED customer. Returns the
+// customer's terms/method codes and whether either lands in a review set. Works for both
+// auto-matched and rep-assigned customers (looked up by number in the cached list).
+async function checkPayment(company, custNo) {
+  if (!custNo) return null;
+  const c = (await allCustomers(company)).find((x) => x.number === custNo);
+  if (!c) return null;
+  const [pt, pm] = await Promise.all([paymentTermsMap(company), paymentMethodsMap(company)]);
+  const termsCode = pt.get(c.paymentTermsId) || null;
+  const methodCode = pm.get(c.paymentMethodId) || null;
+  const isPrepay = !!termsCode && REVIEW_TERMS_CODES.has(termsCode);
+  const isTermsFee = !!methodCode && REVIEW_METHOD_CODES.has(methodCode);
+  const reasons = [];
+  if (isPrepay) reasons.push(`customer is on prepay terms (${termsCode})`);
+  if (isTermsFee) reasons.push(`customer is on term + fee (payment method ${methodCode})`);
+  return { termsCode, methodCode, isPrepay, isTermsFee, review: reasons.length > 0, reason: reasons.length ? `${reasons.join(" and ")} — order needs review before creating` : null };
 }
 
 // Name-substring search over BC customers, for the review app's "search customer" box.
@@ -702,6 +770,15 @@ export async function verifyOrder(order, opts = {}) {
   // per-line priceFlag/priceNote; a mismatch gates to review below.
   const priceRes = await checkPrices(company, order, lines, (order.quote_refs || []).filter(Boolean));
 
+  // Payment gate — resolved customer on prepay terms / term+fee payment method → review.
+  const pay = r1.pass ? await checkPayment(company, custNo) : null;
+
+  // Special-instructions gate — the extractor judged that the PO carries an instruction
+  // customer service must act on (call/confirm, payment change, hold, certs, routing…).
+  const serviceReview = order.service_action_required === true
+    ? { required: true, reason: `special instructions need customer-service action${order.service_action_reason ? `: "${String(order.service_action_reason).replace(/\s+/g, " ").slice(0, 200)}"` : ""}` }
+    : null;
+
   // Disposition: what document to create in BC (after a human approves).
   //   Gates that force a human: customer not matched with high certainty, OR any
   //   line not resolved to a BC item. Otherwise stock ROUTES the document type:
@@ -743,6 +820,10 @@ export async function verifyOrder(order, opts = {}) {
     disposition = "review"; dispositionReason = `customer not confidently matched — ${r1.detail}`;
   } else if (!gateParts) {
     disposition = "review"; dispositionReason = `${lines.length - resolved} of ${lines.length} line(s) not matched to a BC item`;
+  } else if (serviceReview) {
+    disposition = "review"; dispositionReason = serviceReview.reason;
+  } else if (pay?.review) {
+    disposition = "review"; dispositionReason = pay.reason;
   } else if (uomIssue) {
     disposition = "review";
     const n = lines.filter((l) => l.uomFlag).length;
@@ -791,7 +872,7 @@ export async function verifyOrder(order, opts = {}) {
     if (blockedLines.length) holds.push(`⚠ ${blockedLines.length} line(s) blocked in BC (${blockedLines.map((b) => b.item).slice(0, 3).join(", ")}) — excluded from the created doc`);
     if (holds.length) dispositionReason = `${dispositionReason} · ${holds.join(" · ")}`;
   }
-  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines };
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines, paymentReview: pay, serviceReview };
 }
 
 const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };

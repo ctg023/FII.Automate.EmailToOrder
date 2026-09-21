@@ -106,6 +106,21 @@ function holdBlock(r) {
   return bits.length ? `<div class="dupe">${bits.join("<br>")}</div>` : "";
 }
 
+// Payment-terms / payment-method review label (prepay terms, or term+fee method).
+function paymentBlock(r) {
+  const p = r.paymentReview;
+  if (!p || !p.review) return "";
+  const tags = [p.isPrepay ? "PREPAY TERMS" : null, p.isTermsFee ? "TERM + FEE" : null].filter(Boolean).join(" · ");
+  return `<div class="dupe">💳 ${tags} — ${esc(p.reason)}</div>`;
+}
+
+// Special instructions the extractor judged require customer-service action.
+function serviceBlock(r) {
+  if (!r.service_action_required) return "";
+  const why = (r.service_action_reason || "").trim();
+  return `<div class="dupe">📣 Special instructions — customer service must act${why ? `: “${esc(why)}”` : ""}</div>`;
+}
+
 // Warn when this PO already exists in BC (duplicate guard) so a rep doesn't re-key it.
 function dupBlock(r) {
   if (!r.duplicates?.length) return "";
@@ -187,6 +202,8 @@ export function card(r) {
     </summary>
     <div class="detail">
       <div class="disporeason">${esc(r.dispositionReason || "")}</div>
+      ${serviceBlock(r)}
+      ${paymentBlock(r)}
       ${holdBlock(r)}
       ${orderDetailsBlock(r)}
       ${dupBlock(r)}

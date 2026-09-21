@@ -44,4 +44,14 @@ export const OrderExtraction = z.object({
   payment_terms: nstr,
   line_items: z.array(LineItem),
   notes: nstr,
+  // Customer-service action gate. Judge the WHOLE order (body, notes, freight terms, and
+  // line descriptions): does it contain any instruction a human must ACT ON or decide
+  // before the order can be processed normally? TRUE examples: call/contact/confirm with
+  // the buyer, a new or changed credit card or price, hold / do-not-ship-until / ship-
+  // complete-no-partials, required material certs / PPAP / paperwork, or special carrier /
+  // drop-ship-to-end-customer routing that needs a person — and anything similar in
+  // spirit (open-ended, not just these). FALSE for standing constraints that need no
+  // action (e.g. "cartons not to exceed 50 lbs", "use acct #X"). If unsure, prefer TRUE.
+  service_action_required: z.boolean().nullable(),
+  service_action_reason: nstr, // short quote/paraphrase of the instruction(s); null if none
 });

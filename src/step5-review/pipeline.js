@@ -161,12 +161,15 @@ function toRecord(thread, order, res, classification) {
     po_number: order.po_number, order_date: order.order_date, requested_ship_date: order.requested_ship_date,
     customer: order.customer, ship_to: order.ship_to, line_items: order.line_items,
     special_instructions: order.notes || null, // PO/email special instructions (surfaced on the card)
+    service_action_required: order.service_action_required ?? null, // extractor judged CS action needed
+    service_action_reason: order.service_action_reason ?? null,
     quote_refs: order.quote_refs || [],         // referenced BC/Q number(s), for the price check
     company: res.company, rule1: res.rule1, lines: res.lines, linesPass: res.linesPass,
     shipTo: res.shipTo, contact: res.contact, price: res.price,
     disposition: res.disposition, dispositionReason: res.dispositionReason,
     requiresApproval: res.requiresApproval, approvalReason: res.approvalReason,
     orderTotal: res.orderTotal, threshold: res.threshold, blockedLines: res.blockedLines,
+    paymentReview: res.paymentReview,
     classification, conversation: conversationOf(thread), last_received: thread.last_received,
   };
 }
@@ -421,7 +424,7 @@ async function cmdReverify() {
   console.log(`Re-verifying ${targets.length} cached order(s) against BC (no Claude)…\n`);
   for (const x of targets) {
     const r = x.record;
-    const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items, special_instructions: r.special_instructions, quote_refs: quoteRefsFromRecord(r) };
+    const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items, special_instructions: r.special_instructions, service_action_required: r.service_action_required, service_action_reason: r.service_action_reason, quote_refs: quoteRefsFromRecord(r) };
     try {
       const { res, assigned } = await verifyWithAlias(order, r.customer_assigned);
       const was = x.disposition;
@@ -430,6 +433,7 @@ async function cmdReverify() {
       r.disposition = res.disposition; r.dispositionReason = res.dispositionReason; x.disposition = res.disposition;
       r.requiresApproval = res.requiresApproval; r.approvalReason = res.approvalReason;
       r.orderTotal = res.orderTotal; r.threshold = res.threshold; r.blockedLines = res.blockedLines;
+      r.paymentReview = res.paymentReview;
       if (assigned) r.customer_assigned = { number: assigned.number, name: assigned.name };
       console.log(`  ${was === res.disposition ? " " : "→"} ${res.disposition.padEnd(6)} PO ${r.po_number} · ${r.customer?.name || ""}${was !== res.disposition ? `  (was ${was})` : ""}`);
     } catch (e) { console.log(`  ! ${r.po_number}: ${e.message}`); }

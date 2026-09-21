@@ -24,7 +24,8 @@ Return ONLY the structured order, following these rules:
 - Normalize unit_price to price PER EACH. If the document prices per hundred ("Cost/C", "per C", "/100") divide by 100; per thousand ("per M", "/M") divide by 1000. Keep line_total as the document's extended amount.
 - Dates: ISO 8601 (YYYY-MM-DD) when unambiguous; otherwise copy verbatim. requested_ship_date is the customer's requested ship/delivery/due date.
 - Use null for anything not present. NEVER invent a value. If there are no order line items, return an empty line_items array.
-- ship_to is the destination for the goods (may differ from the sender's address).`;
+- ship_to is the destination for the goods (may differ from the sender's address).
+- service_action_required: set TRUE if ANY instruction anywhere in the order (email body, notes, freight terms, or a line description) requires customer service to TAKE AN ACTION or make a decision before the order can be processed — e.g. call/contact/confirm with the buyer, a new or changed credit card or pricing, hold / do-not-ship-until / ship-complete-no-partials, required material certs / PPAP / paperwork, or special carrier / drop-ship-to-end-customer routing that needs a person. Judge intent, not keywords, and this list is not exhaustive. Set FALSE for standing constraints that need no action (e.g. "cartons not to exceed 50 lbs", "use acct #58X-192"). If genuinely unsure whether a human must act, prefer TRUE. Put the exact triggering instruction (a short verbatim quote) in service_action_reason, else null.`;
 
 /** Load a sample's email.json plus any extracted attachment text. */
 export function loadSample(id) {
