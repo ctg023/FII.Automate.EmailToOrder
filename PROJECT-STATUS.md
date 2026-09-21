@@ -24,6 +24,14 @@ Live-backlog hardening from working real orders in the review app:
 - **Order dates + special instructions** surfaced on each card; requested/ship date **falls back to the 1st
   email date** when the PO states none (and populates on the created BC order). Line item shows **✕** (not a
   green ✓) when a qty/UoM/price problem blocks creation.
+- **Mailbox reconcile — auto-drop handled orders** — a card whose **source email is no longer in the Inbox**
+  (deleted or moved out = a rep processed it outside the app) is removed from the queue. Read-only against the
+  mailbox: checks each cached message by id, and — since Graph **default message ids can rotate** — CONFIRMS an
+  id-"gone" with a content `$search` before removing (this guard caught real false-positives in testing: an
+  id said "gone" while the email was still present). Runs in `--run` / `--reconcile`; standalone
+  `--reconcile-mailbox`. On the live backlog it correctly cleared ~50 already-handled orders. NB: this is the
+  automatic version of the previously-noted "handled-outside-app / aging view" gap; still prunes only the local
+  store, so the "mailbox is read-only" rule stands.
 - **Plating / finish substitution (Rule 7)** — customers order the BASE item and request a finish in the line
   text/notes; the plated finish is a different item (`base-P##`). The tool detects the request, reads the
   authoritative **`ARC_Plating_Desc`** off the classic `Item_Card_Excel` page, and **swaps in the plated item

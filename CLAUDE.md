@@ -57,9 +57,14 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     `data/`, keyed by email domain + name) consulted *before* name-matching, so recurring customers stop
     needing review. Created orders set the matched **ship-to address + contact** on the BC doc. Changing the
     customer (`/api/assign`) **re-scans Rules 4 & 5** and updates the Ship-To / Contact panels for the new customer.
-  - Commands: `pipeline.js --run` (process new mail) · `--merge-preview` (show split-PO merges, free) ·
-    `--reverify` (re-apply rules to cache, no Claude) · `--enrich` (dup-check + save PDFs) · `--reconcile` ·
-    `--rerender`. `server.js` serves the app.
+  - **Mailbox reconcile** (read-only): drops cards whose **source email is no longer in the Inbox** (deleted or
+    moved out = a human handled it outside the app). Checks each cached message by id (`messageInInbox`), and —
+    because Graph **default message ids can rotate** — CONFIRMS an id-"gone" with a content `$search`
+    (`inboxContains`) before removing, so a rotated id never drops a present order. Runs inside `--run` and
+    `--reconcile`; standalone `--reconcile-mailbox`. (Still read-only — it prunes the local store, not the mailbox.)
+  - Commands: `pipeline.js --run` (process new mail; also reconciles) · `--merge-preview` (show split-PO merges,
+    free) · `--reverify` (re-apply rules to cache, no Claude) · `--enrich` (dup-check + save PDFs) · `--reconcile`
+    (BC-deleted back to queue + mailbox reconcile) · `--reconcile-mailbox` · `--rerender`. `server.js` serves the app.
 - **Step 6 (order creation):** write **proven** — `src/step6-order-creation/create.js`; `createDoc()` is the
   programmatic path the server calls. Dry-run default; guarded real write. ⚠️ BC assigns a **default** number
   series until the `EMAILORDER` No.-Series **AL codeunit is deployed** (developer task — then S-ORD-EMAIL/S-QUO-EMAIL).
@@ -122,7 +127,8 @@ node src/step5-review/pipeline.js --threads              # FREE: pull + group li
 node src/step5-review/pipeline.js --merge-preview        # FREE: show which split-PO threads would merge
 node src/step5-review/pipeline.js --estimate --limit 3   # cost projection for new threads
 node src/step5-review/pipeline.js --run [--limit N]      # classify+extract+verify new threads (Sonnet)
-node src/step5-review/pipeline.js --reconcile            # return BC-deleted orders to the queue
+node src/step5-review/pipeline.js --reconcile            # BC-deleted orders back to queue + mailbox reconcile
+node src/step5-review/pipeline.js --reconcile-mailbox    # drop cards whose email left the Inbox (handled elsewhere)
 node src/step5-review/server.js                          # serve interactive app at http://localhost:8787
 ```
 The server needs `BC_*` (+ `BC_WEB_URL` for deep links) and `$env:NODE_OPTIONS`. Approve does a dry-run

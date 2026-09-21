@@ -45,10 +45,10 @@ async function token() {
 }
 
 // GET-only Graph client. This function must never be used for a mutating verb.
-async function gget(pathOrUrl) {
+async function gget(pathOrUrl, extraHeaders = {}) {
   if (!TOKEN) TOKEN = await token();
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${GRAPH}${pathOrUrl}`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}`, Accept: "application/json" } });
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}`, Accept: "application/json", ...extraHeaders } });
   const text = await r.text();
   let json; try { json = JSON.parse(text); } catch { /* non-JSON */ }
   return { ok: r.ok, status: r.status, json, text };
@@ -106,6 +106,44 @@ export async function fetchItemAttachmentFiles(messageId, attachmentId) {
   return nested
     .filter((a) => /fileAttachment/i.test(a["@odata.type"] || "") && !a.isInline)
     .map((a) => ({ name: a.name, contentType: a.contentType, isInline: a.isInline, contentBytes: a.contentBytes || null }));
+}
+
+// Read-only: the Inbox folder's id (cached), to test message membership by parentFolderId.
+let INBOX_ID = null;
+async function inboxId() {
+  if (INBOX_ID) return INBOX_ID;
+  const r = await gget(`${mbPath()}/mailFolders/Inbox?$select=id`);
+  INBOX_ID = r.ok ? (r.json?.id || null) : null;
+  return INBOX_ID;
+}
+
+// Read-only: does the Inbox currently contain a message matching this text (a PO number
+// or subject)? A content search that DOESN'T depend on the volatile default message id —
+// used to CONFIRM an id-based "gone" before a card is dropped. -> true | false | null(unknown).
+export async function inboxContains(query) {
+  const q = String(query || "").trim();
+  if (q.length < 3) return null;
+  const r = await gget(
+    `${mbPath()}/mailFolders/Inbox/messages?$search=${encodeURIComponent(`"${q}"`)}&$select=id&$top=1`,
+    { ConsistencyLevel: "eventual" }
+  );
+  if (!r.ok) return null;
+  return (r.json?.value || []).length > 0;
+}
+
+// Read-only: is a message still in the Inbox? Returns "in" | "gone" | "unknown".
+// NOTE: a folder-scoped GET (/mailFolders/Inbox/messages/{id}) does NOT enforce the
+// folder — Graph resolves by id regardless — so we must compare parentFolderId. A
+// hard delete or a MOVE (default ids change on move) yields 404 -> "gone"; a message
+// still in another folder yields a different parentFolderId -> also "gone" (handled).
+// Any non-404 error -> "unknown" so callers never prune on a transient failure.
+export async function messageInInbox(messageId) {
+  const r = await gget(`${mbPath()}/messages/${encodeURIComponent(messageId)}?$select=id,parentFolderId`);
+  if (r.status === 404) return "gone";
+  if (!r.ok || !r.json) return "unknown";
+  const ib = await inboxId();
+  if (!ib) return "unknown";
+  return r.json.parentFolderId === ib ? "in" : "gone";
 }
 
 // Read-only: collect recent messages across folders (Inbox = inbound customer mail,

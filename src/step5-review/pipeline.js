@@ -30,7 +30,7 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createHash } from "node:crypto";
-import { collectThreads, fetchAttachmentBytes, fetchItemAttachmentFiles, fetchThreadByIds } from "../ingestion/mailbox.js";
+import { collectThreads, fetchAttachmentBytes, fetchItemAttachmentFiles, fetchThreadByIds, messageInInbox, inboxContains } from "../ingestion/mailbox.js";
 import { makeClient, extractOne, countOne } from "../step2-extraction/extract.js";
 import { classifyOne } from "../step3-classification/classify.js";
 import { verifyOrder } from "../step4-bc-verification/verify.js";
@@ -334,6 +334,7 @@ async function cmdRun(limit) {
   }
 
   await reconcileActioned(store); // return any orders whose BC doc was deleted
+  await reconcileMailbox(store);   // drop cards whose email was deleted/moved (handled elsewhere)
   store.generated = new Date().toISOString();
   saveStore(store);
   renderFromStore(store);
@@ -358,6 +359,36 @@ async function cmdEnrich() {
   saveStore(store);
   console.log(`  Enriched ${n} order/quote record(s) with BC duplicate check + saved PDFs.`);
   renderFromStore(store);
+}
+
+// Remove cards whose source email is no longer in the Inbox — deleted or moved out
+// means a human handled it outside the app, so it should leave the queue. Read-only
+// against the mailbox (checks each message by id). CONSERVATIVE: a card is dropped only
+// when EVERY one of its messages is definitively gone; if any is still present, or any
+// check is inconclusive (transient API error), the card stays. Skips actioned cards
+// (already out of the queue — and a future move-on-approve would move their mail itself).
+async function reconcileMailbox(store) {
+  const targets = Object.entries(store.threads).filter(([, x]) => x.record && x.record.status !== "actioned");
+  let removed = 0, checked = 0;
+  for (const [cid, x] of targets) {
+    const ids = x.message_ids || [];
+    if (!ids.length) continue;
+    checked++;
+    const states = [];
+    for (const id of ids) states.push(await messageInInbox(id));
+    if (states.some((s) => s === "in" || s === "unknown")) continue; // present or inconclusive -> keep
+    // All ids report gone — but default message ids can rotate, so CONFIRM via a content
+    // search (PO number, else a subject) that the email really isn't in the Inbox before
+    // dropping. Only a definitive "not found" removes; present/unknown keeps.
+    const needle = x.record.po_number || x.record.conversation?.[0]?.subject;
+    const present = await inboxContains(needle);
+    if (present !== false) continue; // true = still there (id rotated) ; null = couldn't confirm -> keep
+    console.log(`  ✂ removed PO ${x.record.po_number} (${x.record.customer?.name || ""}) — email no longer in Inbox`);
+    delete store.threads[cid];
+    removed++;
+  }
+  if (removed) console.log(`  ${removed} card(s) removed — source email deleted/moved (handled outside the app).`);
+  else if (checked) console.log(`  Mailbox reconcile: all ${checked} card(s) still have their email in the Inbox.`);
 }
 
 // Reconcile actioned orders against BC: if a created doc was later DELETED in BC,
@@ -408,6 +439,16 @@ async function cmdReverify() {
 async function cmdReconcile() {
   const store = loadStore();
   await reconcileActioned(store);
+  await reconcileMailbox(store);
+  store.generated = new Date().toISOString();
+  saveStore(store);
+  renderFromStore(store);
+}
+
+// Standalone (no BC, no Claude): drop cards whose email is gone from the Inbox.
+async function cmdReconcileMailbox() {
+  const store = loadStore();
+  await reconcileMailbox(store);
   store.generated = new Date().toISOString();
   saveStore(store);
   renderFromStore(store);
@@ -436,10 +477,11 @@ async function main() {
   if (args.includes("--estimate")) return cmdEstimate(limit);
   if (args.includes("--enrich")) return cmdEnrich(); // BC dup-check + save PDFs for cached orders
   if (args.includes("--reverify")) return cmdReverify(); // re-run BC verify on cache (picks up rule changes)
+  if (args.includes("--reconcile-mailbox")) return cmdReconcileMailbox(); // drop cards whose email left the Inbox
   if (args.includes("--reconcile")) return cmdReconcile(); // return orders deleted in BC to the queue
   if (args.includes("--rerender")) return renderFromStore(loadStore()); // re-render cache, no pull
   if (args.includes("--run")) return cmdRun(limit);
-  console.log("Usage:\n  pipeline.js --threads          (FREE: pull + group + list threads)\n  pipeline.js --merge-preview    (FREE: show PO threads that would merge; no changes)\n  pipeline.js --estimate         (token/cost estimate for new threads)\n  pipeline.js --run [--limit N]  (classify+extract+verify new threads, reconcile, then render)\n  pipeline.js --enrich           (BC dup-check + save PDFs for cached orders)\n  pipeline.js --reconcile        (return orders deleted in BC to the queue)\n  pipeline.js --rerender         (rebuild the page from cache; no pull, no Claude)\n  (add MERGE_THREADS=1 or --merge to fold split PO threads into one card on --run)");
+  console.log("Usage:\n  pipeline.js --threads          (FREE: pull + group + list threads)\n  pipeline.js --merge-preview    (FREE: show PO threads that would merge; no changes)\n  pipeline.js --estimate         (token/cost estimate for new threads)\n  pipeline.js --run [--limit N]  (classify+extract+verify new threads, reconcile, then render)\n  pipeline.js --enrich           (BC dup-check + save PDFs for cached orders)\n  pipeline.js --reconcile        (return orders deleted in BC to the queue)\n  pipeline.js --reconcile-mailbox (drop cards whose email left the Inbox = handled elsewhere)\n  pipeline.js --rerender         (rebuild the page from cache; no pull, no Claude)\n  (add MERGE_THREADS=1 or --merge to fold split PO threads into one card on --run)");
 }
 
 main().catch((e) => { console.error(e.message || e); process.exit(1); });
