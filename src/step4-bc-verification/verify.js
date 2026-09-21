@@ -366,30 +366,46 @@ async function checkShipTo(company, order, custNo) {
   return { pass: false, detail: `PO ship-to (${st.city || "?"} ${st.postal_code || ""}) not among ${rows.length} on file` };
 }
 
-// Rule 5 — is the PO's contact email already associated with the customer? Checks the
-// customer's own email plus every related Contact (via ContactBusinessRelation).
-// Returns the matched contact so create can name it.
+// Rule 5 — is the PO's contact already associated with the customer? In BC the
+// customer has a *company* contact (via ContactBusinessRelation), and the individual
+// buyers are Person contacts linked by Company_No to that company contact. We match
+// the PO's contact EMAIL (works in production) with a NAME fallback (works even in the
+// test instance, where emails are scrubbed to a single placeholder). Returns the
+// matched contact so create can name it.
 async function checkContact(company, order, custNo) {
   const email = String(order?.customer?.contact_email || "").toLowerCase().trim();
-  if (!email) return { pass: false, detail: "no contact email on the PO to match" };
+  const wantName = normName(order?.customer?.contact_name || "");
+  if (!email && !wantName) return { pass: false, detail: "no contact email/name on the PO to match" };
+  const ODC = `${ODBASE}/Company(${odataStr(company.name)})`;
+
+  // the customer's company contact
+  const rel = await get(encodeURI(`${ODC}/ContactBusinessRelation?$filter=No eq ${odataStr(custNo)}&$select=Contact_No,Link_to_Table`));
+  const companyContactNo = (rel.json?.value || []).find((x) => /customer/i.test(x.Link_to_Table || ""))?.Contact_No;
+
+  // customer's own email + every Person contact under the company contact
   const emails = new Set();
+  const people = [];
   const cr = await get(`companies(${company.id})/customers?$filter=number eq ${odataStr(custNo)}&$select=email`);
   const custEmail = String(cr.json?.value?.[0]?.email || "").toLowerCase().trim();
   if (custEmail) emails.add(custEmail);
-  const ODC = `${ODBASE}/Company(${odataStr(company.name)})`;
-  const rel = await get(encodeURI(`${ODC}/ContactBusinessRelation?$filter=No eq ${odataStr(custNo)}&$select=Contact_No,Link_to_Table`));
-  const contactNos = (rel.json?.value || []).filter((x) => /customer/i.test(x.Link_to_Table || "")).map((x) => x.Contact_No).filter(Boolean);
-  let matched = null;
-  for (const grp of chunk(contactNos, 15)) {
-    const f = grp.map((n) => `No eq ${odataStr(n)}`).join(" or ");
-    const cs = await get(encodeURI(`${ODC}/Contact?$filter=${f}&$select=No,Name,E_Mail`));
-    for (const c of cs.json?.value || []) {
+  if (companyContactNo) {
+    const res = await getAll(encodeURI(`${ODC}/Contact?$filter=Company_No eq ${odataStr(companyContactNo)}&$select=No,Name,E_Mail`));
+    for (const c of res.rows || []) {
       const e = String(c.E_Mail || "").toLowerCase().trim();
-      if (e) { emails.add(e); if (e === email && !matched) matched = { no: c.No, name: c.Name }; }
+      if (e) emails.add(e);
+      people.push({ no: c.No, name: c.Name, email: e });
     }
   }
-  if (emails.has(email)) return { pass: true, detail: matched ? `matched contact ${matched.no} (${matched.name})` : "matched customer email", contact: matched };
-  return { pass: false, detail: `PO contact "${email}" not on file for this customer (${emails.size} known email(s))` };
+
+  // match: email against a person, else customer-level email, else name against a person
+  let matched = email ? people.find((p) => p.email === email) : null;
+  let via = matched ? "email" : null;
+  if (!matched && email && emails.has(email)) { matched = { no: null, name: null }; via = "customer email"; }
+  if (!matched && wantName) { const p = people.find((x) => normName(x.name) === wantName); if (p) { matched = p; via = "name"; } }
+  if (matched) {
+    return { pass: true, detail: matched.no ? `matched contact ${matched.no} (${matched.name}) [via ${via}]` : "matched customer email", contact: matched.no ? { no: matched.no, name: matched.name } : null };
+  }
+  return { pass: false, detail: `PO contact "${email || order?.customer?.contact_name || "?"}" not on file (${people.length} contact(s) under customer)` };
 }
 
 // Cached full customer list (BC has ~9k; the pull is the slow part). Cached for 10
