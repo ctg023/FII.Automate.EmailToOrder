@@ -49,6 +49,23 @@ const csvSet = (s) => new Set(String(s || "").split(",").map((x) => x.trim().toU
 const REVIEW_TERMS_CODES = csvSet(process.env.REVIEW_TERMS_CODES || "PREPAY");
 const REVIEW_METHOD_CODES = csvSet(process.env.REVIEW_METHOD_CODES || "TERMS+FEE");
 
+// Special-instruction categories that genuinely need a human before creating (the routine
+// "acknowledge/confirm price & delivery" ask is intentionally NOT here — the ack email
+// covers it). First match wins; returns the gate object or null.
+const SVC_CATS = [
+  { kind: "payment", label: "payment / credit-card change", re: /credit\s*card|card (?:to charge|on file|number|#|you would like)|charge (?:the|my|to)\s*card|new (?:credit )?card|last\s*\d\s*digits|update (?:the )?(?:card|payment)/i },
+  { kind: "certs", label: "certs / test reports required", re: /cert(?:ificat\w*|s)?\b|test report|mill (?:cert|test)|\brohs\b|\breach\b|\bppap\b|\bisir\b|physical and chemical|chemical and physical|traceabilit|material\s*cert|heat.?treat|first article|\bfai\b/i },
+  { kind: "ship", label: "partial / split ship or hold", re: /partial (?:ship|deliver|order|qty|quantity)|split ship|do not ship (?:until|before|prior)|ship complete|no partial|hold (?:for|until|the order|shipment)|back.?order|drop.?ship/i },
+  { kind: "discrepancy", label: "price / quantity discrepancy", re: /price[^.]{0,40}(?:incorrect|is wrong|discrepan|does not match|doesn.t match|differ)|incorrect price|wrong price|did not order|didn.t order|i ordered|quantit\w*[^.]{0,20}(?:wrong|incorrect|mismatch|not match)|wrong (?:quantity|qty)/i },
+];
+function serviceActionGate(text) {
+  const t = String(text || "");
+  for (const c of SVC_CATS) {
+    if (c.re.test(t)) return { required: true, kind: c.kind, reason: `special instructions need customer-service action — ${c.label}` };
+  }
+  return null; // routine acknowledge/confirm ask (or nothing actionable) → don't gate
+}
+
 async function get(pathOrUrl) {
   const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${BASE}/${pathOrUrl}`;
   const res = await fetch(url, { headers: { Authorization: AUTH, Accept: "application/json" } });
@@ -371,6 +388,8 @@ function orderTotal(order) {
   return { total, priced };
 }
 const usd = (n) => `$${Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+// Unit price: keep fastener precision (up to 5 decimals), min 2 — so $0.108 / $0.0575 don't round to $0.11.
+const uprice = (n) => (Number.isFinite(Number(n)) ? `$${Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 5 })}` : "—");
 
 // --- Plating substitution ----------------------------------------------------
 // Customers often order the BASE item number and ask (in the line text / notes) for a
@@ -553,16 +572,31 @@ const normPost = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").
 const streetNo = (s) => (String(s || "").match(/\d+/) || [""])[0];
 const chunk = (a, n) => { const o = []; for (let i = 0; i < a.length; i += n) o.push(a.slice(i, i + n)); return o; };
 
+// All of a customer's ship-to addresses on file (the published `ShipTo` page). Used by
+// the ship-to match AND by the review app's "change ship-to" picker.
+async function shipTosForCustomer(company, custNo) {
+  const url = encodeURI(`${ODBASE}/Company(${odataStr(company.name)})/ShipTo?$filter=Customer_No eq ${odataStr(custNo)}&$select=Code,Name,Address,Address_2,City,Post_Code,County,Contact,E_Mail`);
+  const r = await get(url);
+  return { ok: r.ok, status: r.status, rows: r.json?.value || [] };
+}
+
+// Public: the customer's ship-to list for the picker (server /api/shiptos).
+export async function listShipTos(custNo) {
+  if (!custNo) return [];
+  const company = await resolveCompany();
+  const { rows } = await shipTosForCustomer(company, custNo);
+  return rows.map((r) => ({ code: r.Code, name: r.Name, address: r.Address, address2: r.Address_2, city: r.City, state: r.County, postalCode: r.Post_Code, contact: r.Contact, email: r.E_Mail }));
+}
+
 // Rule 4 — does the PO ship-to match one of the customer's ship-to addresses on file?
-// Uses the published `ShipTo` OData page. Match = same postal code AND (same city or
-// same street number). Returns the matched row so create can copy its address.
+// Match = same postal code AND (same city or same street number). Returns the matched
+// row so create can copy its address.
 async function checkShipTo(company, order, custNo) {
   const st = order?.ship_to || {};
   const wantPost = normPost(st.postal_code), wantCity = normGeo(st.city), wantNum = streetNo(st.line1);
-  const url = encodeURI(`${ODBASE}/Company(${odataStr(company.name)})/ShipTo?$filter=Customer_No eq ${odataStr(custNo)}&$select=Code,Name,Address,Address_2,City,Post_Code,County,Contact,E_Mail`);
-  const r = await get(url);
+  const r = await shipTosForCustomer(company, custNo);
   if (!r.ok) return { pass: false, detail: `ship-to lookup failed (HTTP ${r.status})` };
-  const rows = r.json?.value || [];
+  const rows = r.rows;
   if (!rows.length) return { pass: false, detail: "customer has no ship-to addresses on file" };
   for (const row of rows) {
     const postOK = wantPost && wantPost === normPost(row.Post_Code);
@@ -738,6 +772,7 @@ async function checkPrices(company, order, lines, quoteNos) {
     if (!q) { l.priceNote = "item not on the referenced quote"; continue; }
     if (!Number.isFinite(poPrice)) { l.priceNote = `PO line has no price (quote ${q.unitPrice})`; continue; }
     compared++;
+    l.quotePriced = true; // a referenced quote governs this line's price → Rule 8 defers to it
     const src = `BC/Q ${q.quote}${q.via && q.via.startsWith("order") ? ` → ${q.via}` : ""}`;
     if (Math.abs(poPrice - q.unitPrice) > PRICE_TOL) {
       l.priceFlag = true;
@@ -748,6 +783,103 @@ async function checkPrices(company, order, lines, quoteNos) {
     }
   }
   return { checked: true, compared, mismatches, quotes: quoteNos, detail: mismatches ? `${mismatches} of ${compared} priced line(s) differ from the quote` : `all ${compared} priced line(s) match the quote` };
+}
+
+// --- Rule 8: PO price vs BC PRICE LIST (customer-specific + quantity breaks) ----------
+// BC prices via Price Lists (page Price_List_Lines_Excel). Sales lines carry Unit_Price>0
+// (purchase/vendor lines don't), Source_Type Customer / Customer Price Group / (All), a
+// Minimum_Quantity (the break), UoM, Currency and date range. Precedence (per decision):
+// customer-specific → price group → all-customers; then the highest break ≤ ordered qty.
+// A referenced quote (Rule 6) still wins for lines it priced. Base Unit_Price only (v1);
+// a line discount is reported, not applied.
+
+// Customer currency + price group (for precedence), cached 10 min.
+let CUSTMETA = new Map();
+async function customerPricing(company, custNo) {
+  const hit = CUSTMETA.get(custNo);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit;
+  const C = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const r = await get(encodeURI(`${C}/Customer_Card_Excel?$filter=No eq ${odataStr(custNo)}&$select=No,Currency_Code,Customer_Price_Group`));
+  const row = r.json?.value?.[0] || {};
+  const rec = { currency: (row.Currency_Code || "").toUpperCase(), priceGroup: row.Customer_Price_Group || "", at: Date.now() };
+  CUSTMETA.set(custNo, rec);
+  return rec;
+}
+
+// Active sales price-list lines for one item (Unit_Price>0 = a sale, not a purchase line),
+// cached 10 min per item.
+let PLL_CACHE = new Map();
+async function priceLinesForItem(company, itemNo) {
+  const key = stripSD(itemNo);
+  const hit = PLL_CACHE.get(key);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.rows;
+  const C = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const filt = `Asset_Type eq 'Item' and Asset_No eq ${odataStr(itemNo)} and Status eq 'Active' and Unit_Price gt 0 and (Source_Type eq 'Customer' or Source_Type eq 'Customer Price Group' or Source_Type eq 'All Customers')`;
+  const r = await getAll(encodeURI(`${C}/Price_List_Lines_Excel?$filter=${filt}&$select=Source_Type,Source_No,Unit_of_Measure_Code,Minimum_Quantity,Unit_Price,Currency_Code,Starting_Date,Ending_Date,Amount_Type,Line_Discount_Percent`));
+  const rows = r.ok ? r.rows : [];
+  PLL_CACHE.set(key, { rows, at: Date.now() });
+  return rows;
+}
+
+const toDate = (s) => { const d = new Date(s); return isNaN(d) ? null : d; };
+// Resolve what BC's "Get Price" would charge for a customer+item+qty, replicating the
+// default LOWEST-PRICE method: among every price line the customer is eligible for
+// (their own Customer lines + their price group + All Customers), matching UoM / currency
+// / date and with Minimum_Quantity ≤ ordered qty, take the LOWEST Unit_Price (the deepest
+// applicable break, or a lower negotiated customer price). -> {unitPrice,minQ,source,...}|null
+async function bcPriceFor(company, custNo, itemNo, qty, uom, orderDate) {
+  const rows = await priceLinesForItem(company, itemNo);
+  if (!rows.length) return null;
+  const meta = await customerPricing(company, custNo);
+  const localCust = !meta.currency || meta.currency === "USD";
+  const od = orderDate ? (toDate(orderDate) || new Date()) : new Date();
+  const q = Number(qty) || 0;
+  let elig = rows.filter((r) => {
+    if (r.Source_Type === "Customer") return r.Source_No === custNo;
+    if (r.Source_Type === "Customer Price Group") return meta.priceGroup && r.Source_No === meta.priceGroup;
+    return r.Source_Type === "All Customers";
+  });
+  elig = elig.filter((r) => { const lc = (r.Currency_Code || "").toUpperCase(); return localCust ? lc === "" : lc === meta.currency; });
+  elig = elig.filter((r) => {
+    const sd = toDate(r.Starting_Date), ed = toDate(r.Ending_Date);
+    const startOK = !sd || sd <= od;
+    const endOpen = !ed || ed.getFullYear() <= 1; // BC 0001-01-01 = open-ended
+    return startOK && (endOpen || ed >= od);
+  });
+  if (uom) { const nu = String(uom).toUpperCase().trim(); const um = elig.filter((r) => String(r.Unit_of_Measure_Code || "").toUpperCase() === nu); if (um.length) elig = um; }
+  const applic = elig.filter((r) => Number(r.Minimum_Quantity || 0) <= q); // break must be reached
+  if (!applic.length) return null; // qty below the smallest break → no standing price at this qty
+  let best = applic[0];
+  for (const r of applic) if (Number(r.Unit_Price) < Number(best.Unit_Price)) best = r; // lowest price wins
+  const source = best.Source_Type === "Customer" ? "customer" : best.Source_Type === "Customer Price Group" ? "price group" : "all-customers";
+  return { unitPrice: Number(best.Unit_Price), minQ: Number(best.Minimum_Quantity || 0), uom: best.Unit_of_Measure_Code, source, discountPct: Number(best.Line_Discount_Percent || 0) };
+}
+
+// Compare each resolved line's PO price to the BC price-list price. Skips lines a
+// referenced quote already priced (Rule 6 wins). Sets l.bcPriceFlag / l.bcPriceNote.
+async function checkBcPrices(company, order, lines, custNo) {
+  if (!custNo) return { checked: false };
+  let compared = 0, mismatches = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.item || l.quotePriced) continue;
+    const li = order.line_items?.[i] || {};
+    const poPrice = Number(li.unit_price);
+    const bc = await bcPriceFor(company, custNo, l.item, li.quantity, li.uom, order.order_date);
+    if (!bc) { l.bcPriceNote = "no BC price-list price on file for this item/qty"; continue; }
+    const disc = bc.discountPct ? ` (also ${bc.discountPct}% line disc — not applied)` : "";
+    const tag = `BC ${bc.source} price ${uprice(bc.unitPrice)}/ea @ ${Number(bc.minQ).toLocaleString("en-US")}+`;
+    if (!Number.isFinite(poPrice) || poPrice <= 0) { l.bcPriceNote = `${tag}${disc} — PO has no price`; continue; }
+    compared++;
+    if (Math.abs(poPrice - bc.unitPrice) > PRICE_TOL) {
+      l.bcPriceFlag = true;
+      l.bcPriceNote = `⚠ PO ${uprice(poPrice)} ≠ ${tag}${disc}`;
+      mismatches++;
+    } else {
+      l.bcPriceNote = `price matches ${tag}${disc}`;
+    }
+  }
+  return { checked: compared > 0, compared, mismatches };
 }
 
 export async function verifyOrder(order, opts = {}) {
@@ -774,6 +906,10 @@ export async function verifyOrder(order, opts = {}) {
   // per-line priceFlag/priceNote; a mismatch gates to review below.
   const priceRes = await checkPrices(company, order, lines, (order.quote_refs || []).filter(Boolean));
 
+  // Rule 8 — PO price vs BC price list (customer-specific + qty breaks). Skips lines a
+  // referenced quote already priced. Sets per-line bcPriceFlag/bcPriceNote; mismatch gates.
+  const bcPriceRes = r1.pass ? await checkBcPrices(company, order, lines, custNo) : { checked: false };
+
   // Payment gate — resolved customer on prepay terms / term+fee payment method → review.
   const pay = r1.pass ? await checkPayment(company, custNo) : null;
 
@@ -781,10 +917,14 @@ export async function verifyOrder(order, opts = {}) {
   // Ship / Invoice / All can't be sold to without a human.
   const customerBlocked = pay?.blocked ? { code: pay.blockedCode } : null;
 
-  // Special-instructions gate — the extractor judged that the PO carries an instruction
-  // customer service must act on (call/confirm, payment change, hold, certs, routing…).
+  // Special-instructions gate. The extractor flags ANY special instruction
+  // (service_action_required); here we gate ONLY the ones that genuinely need a human,
+  // per the business rule. The routine "acknowledge / confirm the PO with price &
+  // delivery/ship date within X" ask does NOT block — the acknowledgement email (and the
+  // urgency flag for tight deadlines) handles it; the raw instruction still shows on the
+  // card. Only these categories hold for review:
   const serviceReview = order.service_action_required === true
-    ? { required: true, reason: `special instructions need customer-service action${order.service_action_reason ? `: "${String(order.service_action_reason).replace(/\s+/g, " ").slice(0, 200)}"` : ""}` }
+    ? serviceActionGate(`${order.service_action_reason || ""}  ${order.special_instructions || order.notes || ""}`)
     : null;
 
   // Disposition: what document to create in BC (after a human approves).
@@ -798,6 +938,7 @@ export async function verifyOrder(order, opts = {}) {
   const qtyIssue = lines.some((l) => l.qtyFlag); // piece qty not a multiple of QTY_STEP (e.g. 2120)
   const platingIssue = lines.some((l) => l.platingFlag); // plating requested but not resolved to one variant
   const priceIssue = priceRes.checked && priceRes.mismatches > 0; // PO price != referenced quote
+  const bcPriceIssue = bcPriceRes.checked && bcPriceRes.mismatches > 0; // PO price != BC price list
   // Blocked items are EXCLUDED from the created doc, so the order/quote decision (and
   // stock check) considers only the NON-blocked lines. If EVERY line is blocked there is
   // nothing left to create -> hard review.
@@ -849,6 +990,9 @@ export async function verifyOrder(order, opts = {}) {
   } else if (priceIssue) {
     disposition = "review";
     dispositionReason = `${priceRes.mismatches} line(s) priced differently from the referenced quote (BC/Q ${priceRes.quotes.join(", ")}) — confirm the price before creating`;
+  } else if (bcPriceIssue) {
+    disposition = "review";
+    dispositionReason = `${bcPriceRes.mismatches} line(s) priced differently from the BC price list (customer/qty-break price) — confirm the price before creating`;
   } else if (allBlocked) {
     disposition = "review";
     dispositionReason = `all ${lines.length} line(s) are blocked in BC — nothing left to create`;
@@ -860,7 +1004,15 @@ export async function verifyOrder(order, opts = {}) {
   // Set CONTACT_GATE=1 to make it a hard gate (only sensible once BC contacts are populated).
   let shipToRes = null, contactRes = null;
   if (!disposition) {
-    shipToRes = await checkShipTo(company, order, custNo);
+    // A rep picked a ship-to in the app (forceShipTo = its Code) — trust it, skip matching.
+    if (opts.forceShipTo) {
+      const picked = (await shipTosForCustomer(company, custNo)).rows.find((x) => x.Code === opts.forceShipTo);
+      shipToRes = picked
+        ? { pass: true, detail: `assigned ship-to "${picked.Code}" (${picked.City || ""} ${picked.Post_Code || ""})`, shipTo: picked, assigned: true }
+        : { pass: false, detail: `assigned ship-to "${opts.forceShipTo}" not found for this customer` };
+    } else {
+      shipToRes = await checkShipTo(company, order, custNo);
+    }
     contactRes = await checkContact(company, order, custNo);
     const contactNote = contactRes.pass ? "" : " (contact not on file)";
     if (!shipToRes.pass) {
@@ -882,7 +1034,7 @@ export async function verifyOrder(order, opts = {}) {
     if (blockedLines.length) holds.push(`⚠ ${blockedLines.length} line(s) blocked in BC (${blockedLines.map((b) => b.item).slice(0, 3).join(", ")}) — excluded from the created doc`);
     if (holds.length) dispositionReason = `${dispositionReason} · ${holds.join(" · ")}`;
   }
-  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines, paymentReview: pay, serviceReview, customerBlocked };
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines, paymentReview: pay, serviceReview, customerBlocked, bcPrice: bcPriceRes };
 }
 
 const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };

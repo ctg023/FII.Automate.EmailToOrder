@@ -122,8 +122,26 @@ export async function docExists(company, docType, number) {
   return r.ok && (r.json?.value?.length > 0);
 }
 
-export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false, forceCustomer = null, approval = null } = {}) {
-  const res = await verifyOrder(order, forceCustomer ? { forceCustomer } : {});
+// Post-create: set the ESTABLISHED Ship-to Code on the doc via the classic page (the
+// standard API has no shipToCode field — only address lines). Best-effort: setting the
+// code makes BC pull the on-file address; if the classic page is read-only or the key
+// differs, we keep the address fields already written. Non-fatal.
+async function setShipToCode(company, docType, number, code) {
+  const ODBASE = BASE.replace(/\/api\/v2\.0$/i, "/ODataV4");
+  const odStr = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  const page = docType === "quote" ? "Sales_Quote_Excel" : "Sales_Order_Excel";
+  const dt = docType === "quote" ? "Quote" : "Order";
+  const url = encodeURI(`${ODBASE}/Company(${odStr(company.name)})/${page}(Document_Type=${odStr(dt)},No=${odStr(number)})`);
+  const r = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: AUTH, "Content-Type": "application/json", "If-Match": "*" },
+    body: JSON.stringify({ Ship_to_Code: code }),
+  });
+  return { ok: r.ok, status: r.status, text: (await r.text().catch(() => "")).slice(0, 200) };
+}
+
+export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false, forceCustomer = null, forceShipTo = null, approval = null } = {}) {
+  const res = await verifyOrder(order, { ...(forceCustomer ? { forceCustomer } : {}), ...(forceShipTo ? { forceShipTo } : {}) });
   if (res.disposition === "review") {
     return { ok: false, stage: "verify", disposition: res.disposition, dispositionReason: res.dispositionReason };
   }
@@ -163,7 +181,15 @@ export async function createDoc(order, { doCreate = false, targetCompany = null,
     const lr = await api("POST", `companies(${company.id})/${doc.ent}(${docId})/${doc.lineEnt}`, line);
     lineResults.push({ item: line.lineObjectNumber, quantity: line.quantity, ok: lr.ok, status: lr.status });
   }
-  return { ok: true, created: true, docType: doc.docType, number, id: docId, company: company.name, duplicates, lineResults, approvedBy: signOff, blockedExcluded: res.blockedLines || [] };
+  // Set the established Ship-to Code (best-effort) so the doc uses the on-file ship-to
+  // rather than a custom address. Only when we have a ship-to Code (matched or rep-picked).
+  let shipToCode = null;
+  const code = res.shipTo?.shipTo?.Code;
+  if (code) {
+    try { const pr = await setShipToCode(company, doc.docType, number, code); shipToCode = pr.ok ? code : `not set (HTTP ${pr.status})`; }
+    catch (e) { shipToCode = `not set (${e.message})`; }
+  }
+  return { ok: true, created: true, docType: doc.docType, number, id: docId, company: company.name, duplicates, lineResults, approvedBy: signOff, blockedExcluded: res.blockedLines || [], shipToCode };
 }
 
 async function run({ orderPath, doCreate, targetCompany, allowDuplicate, approver }) {

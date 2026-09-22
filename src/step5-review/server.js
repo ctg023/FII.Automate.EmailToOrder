@@ -18,7 +18,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve, normalize, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { createDoc } from "../step6-order-creation/create.js";
-import { verifyOrder, searchCustomers } from "../step4-bc-verification/verify.js";
+import { verifyOrder, searchCustomers, listShipTos } from "../step4-bc-verification/verify.js";
 import { setAlias } from "./aliases.js";
 import { acknowledge } from "./acknowledge.js";
 import { page } from "./render.js";
@@ -114,8 +114,13 @@ async function handle(req, res) {
     const store = loadStore();
     const records = openRecords(store);
     const tally = records.reduce((t, r) => ((t[r.disposition] = (t[r.disposition] || 0) + 1), t), {});
+    // Actioned orders whose acknowledgement failed to send (excludes intentional dry-runs).
+    const needsAck = Object.values(store.threads)
+      .map((x) => x.record)
+      .filter((r) => r && r.status === "actioned" && r.ack && r.ack.sent === false && !/dry-run/i.test(r.ack.reason || ""))
+      .sort((a, b) => (b.ack?.at || "").localeCompare(a.ack?.at || ""));
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    return res.end(page({ generated: store.generated, records, tally }, { interactive: true }));
+    return res.end(page({ generated: store.generated, records, tally, needsAck }, { interactive: true }));
   }
   if (req.method === "GET" && p.startsWith("/pdfs/")) return servePdf(req, res, p);
 
@@ -153,9 +158,52 @@ async function handle(req, res) {
       r.requiresApproval = res2.requiresApproval; r.approvalReason = res2.approvalReason;
       r.orderTotal = res2.orderTotal; r.threshold = res2.threshold; r.blockedLines = res2.blockedLines;
       r.customer_assigned = { number: customerNumber, name: customerName };
+      delete r.shipto_assigned; // a prior ship-to pick belongs to the old customer
       saveStore(store);
       // Learn from the pick: future emails from this customer (domain/name) auto-resolve.
       setAlias({ email: r.customer?.contact_email, name: r.customer?.name, number: customerNumber, customerName });
+      return json(res, 200, { ok: true, disposition: res2.disposition, dispositionReason: res2.dispositionReason });
+    } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
+
+  // Resend a failed order acknowledgement for an already-created order.
+  if (req.method === "POST" && p === "/api/resend-ack") {
+    const { conversationId } = await readBody(req);
+    const store = loadStore();
+    const entry = store.threads[conversationId];
+    if (!entry?.record?.bc_number) return json(res, 404, { ok: false, reason: "no created order for this thread" });
+    const r = entry.record;
+    try {
+      const ack = await acknowledge(r, { docType: r.bc_docType, number: r.bc_number });
+      r.ack = { sent: !!ack.sent, to: ack.to || null, subject: ack.subject || null, reason: ack.reason || null, at: new Date().toISOString() };
+      saveStore(store);
+      return json(res, 200, { ok: true, sent: r.ack.sent, to: r.ack.to, reason: r.ack.reason });
+    } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
+
+  // List the (resolved) customer's ship-to addresses for the "change ship-to" picker.
+  if (req.method === "GET" && p === "/api/shiptos") {
+    const entry = loadStore().threads[url.searchParams.get("conversationId")];
+    const custNo = entry?.record?.customer_assigned?.number || entry?.record?.rule1?.match?.number;
+    if (!custNo) return json(res, 200, { ok: true, results: [] });
+    try { return json(res, 200, { ok: true, results: await listShipTos(custNo) }); }
+    catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
+
+  // Assign a ship-to a rep picked, then re-verify (clears the ship-to gate).
+  if (req.method === "POST" && p === "/api/assign-shipto") {
+    const { conversationId, code } = await readBody(req);
+    const store = loadStore();
+    const entry = store.threads[conversationId];
+    if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
+    const r = entry.record;
+    const fc = r.customer_assigned ? { number: r.customer_assigned.number, displayName: r.customer_assigned.name } : null;
+    try {
+      const res2 = await verifyOrder(orderFromRecord(r), { ...(fc ? { forceCustomer: fc } : {}), forceShipTo: code });
+      r.shipTo = res2.shipTo; r.contact = res2.contact;
+      r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
+      r.shipto_assigned = { code };
+      saveStore(store);
       return json(res, 200, { ok: true, disposition: res2.disposition, dispositionReason: res2.dispositionReason });
     } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
   }
@@ -165,7 +213,8 @@ async function handle(req, res) {
     const entry = loadStore().threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
     const fc = entry.record.customer_assigned ? { number: entry.record.customer_assigned.number, displayName: entry.record.customer_assigned.name } : null;
-    try { return json(res, 200, await createDoc(orderFromRecord(entry.record), { doCreate: false, forceCustomer: fc })); }
+    const fs = entry.record.shipto_assigned?.code || null;
+    try { return json(res, 200, await createDoc(orderFromRecord(entry.record), { doCreate: false, forceCustomer: fc, forceShipTo: fs })); }
     catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
   }
 
@@ -175,10 +224,11 @@ async function handle(req, res) {
     const entry = store.threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
     const fc = entry.record.customer_assigned ? { number: entry.record.customer_assigned.number, displayName: entry.record.customer_assigned.name } : null;
+    const fs = entry.record.shipto_assigned?.code || null;
     try {
       // `approver` = the second, independent sign-off for high-value POs (createDoc
       // refuses a high-value write without it). Ignored for normal-value POs.
-      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate, forceCustomer: fc, approval: approver });
+      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate, forceCustomer: fc, forceShipTo: fs, approval: approver });
       if (out.ok && out.created) { // mark actioned so it leaves the open queue
         entry.record.status = "actioned"; entry.record.bc_number = out.number; entry.record.bc_docType = out.docType;
         entry.record.bc_url = bcLink(out.docType, out.number);

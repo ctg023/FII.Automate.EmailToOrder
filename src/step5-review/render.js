@@ -28,6 +28,7 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const n = (x) => (x == null ? "" : Number(x).toLocaleString("en-US"));
 const usd = (x) => (Number.isFinite(Number(x)) ? `$${Number(x).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—");
+const uprice = (x) => (Number.isFinite(Number(x)) ? `$${Number(x).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 5 })}` : "—"); // keep fastener precision
 
 const BADGE = {
   order: ['<span class="badge ok">→ ORDER</span>', "order"],
@@ -77,10 +78,11 @@ function suggestionBtn(s) {
 // in stock, AND no blocking quantity/UoM problem. A resolved+in-stock line whose
 // quantity isn't safe to create (not a multiple of 100, or a multiplier UoM) shows ✕.
 function lineRow(l, poLine) {
-  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag && !l.platingFlag && !l.blockedFlag;
+  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag && !l.platingFlag && !l.blockedFlag && !l.bcPriceFlag;
   const state = ok ? "ok" : "bad";
   const mark = ok ? "✓" : l.rule2 ? "✕" : "!";
   const priceNote = l.priceNote ? `<div class="sub">${l.priceFlag ? "⚠ " : ""}${esc(l.priceNote)}</div>` : "";
+  const bcPriceNote = l.bcPriceNote ? `<div class="sub">${l.bcPriceFlag ? "⚠ " : ""}${esc(l.bcPriceNote)}</div>` : "";
   const blockedNote = l.blockedFlag ? `<div class="sub" style="color:var(--bad);font-weight:600">⛔ Item ${esc(l.item || "")} is BLOCKED in BC — this line is excluded from the created doc.</div>` : "";
   // The customer's price ON THE PO, shown prominently so a rep can confirm it (esp. when
   // the email says "confirm price"). "Our price" isn't reliably available pre-create; the
@@ -90,7 +92,7 @@ function lineRow(l, poLine) {
   const qty = poLine ? num(poLine.quantity) : null;
   const ext = price != null && qty != null ? price * qty : (poLine ? num(poLine.line_total) : null);
   const priceLine = price != null
-    ? `<div class="poprice">PO price: <b>${usd(price)}</b>/ea${qty != null ? ` × ${n(qty)}` : ""}${ext != null ? ` = <b>${usd(ext)}</b>` : ""}</div>`
+    ? `<div class="poprice">PO price: <b>${uprice(price)}</b>/ea${qty != null ? ` × ${n(qty)}` : ""}${ext != null ? ` = <b>${usd(ext)}</b>` : ""}</div>`
     : (poLine ? `<div class="poprice none">No price on the PO for this line</div>` : "");
   return `<div class="check">
       <span class="dot ${state}">${mark}</span>
@@ -99,6 +101,7 @@ function lineRow(l, poLine) {
         <div class="sub">${esc(l.detail)}</div>
         ${priceLine}
         ${priceNote}
+        ${bcPriceNote}
         ${blockedNote}
       </div></div>`;
 }
@@ -162,11 +165,14 @@ function paymentBlock(r) {
   return `<div class="dupe">💳 ${tags} — ${esc(p.reason)}</div>`;
 }
 
-// Special instructions the extractor judged require customer-service action.
+// Special instructions that GATE the order to review (genuine CS action needed). The
+// routine acknowledge/confirm ask doesn't gate and isn't shown here — it still appears as
+// context in the order-details "Special instructions" line.
 function serviceBlock(r) {
-  if (!r.service_action_required) return "";
+  if (!r.serviceReview?.required) return "";
+  const label = r.serviceReview.reason || "special instructions need customer-service action";
   const why = (r.service_action_reason || "").trim();
-  return `<div class="dupe">📣 Special instructions — customer service must act${why ? `: “${esc(why)}”` : ""}</div>`;
+  return `<div class="dupe">📣 ${esc(label)}${why ? `: “${esc(why)}”` : ""}</div>`;
 }
 
 // Warn when this PO already exists in BC (duplicate guard) so a rep doesn't re-key it.
@@ -184,13 +190,23 @@ function attachBlock(r) {
 }
 
 // Ship-to and contact validation results (Rules 4 & 5), shown when they were checked.
+// The Ship-to row carries a "change" link that opens a picker of the customer's on-file
+// ship-to addresses (loaded live from BC) so a rep can fix a ship-to that didn't match.
 function shipContactBlock(r) {
   if (!r.shipTo && !r.contact) return "";
-  const row = (label, res) => res
-    ? `<div class="check"><span class="dot ${res.pass ? "ok" : "bad"}">${res.pass ? "✓" : "✕"}</span>
-        <div class="txt"><span class="k">${label}</span><div class="sub">${esc(res.detail || "")}</div></div></div>`
+  const canPick = !!r.rule1?.pass; // need a resolved customer to list ship-tos for
+  const shipRow = r.shipTo
+    ? `<div class="check"><span class="dot ${r.shipTo.pass ? "ok" : "bad"}">${r.shipTo.pass ? "✓" : "✕"}</span>
+        <div class="txt"><span class="k">Ship-to</span>
+          <div class="sub">${esc(r.shipTo.detail || "")}${canPick ? ` <button class="changelink" data-act="change-shipto">change</button>` : ""}</div>
+          ${canPick ? `<div class="shipfix" hidden><div class="csresults suggs"></div></div>` : ""}
+        </div></div>`
     : "";
-  return `<div class="sec">Ship-to &amp; contact</div>${row("Ship-to", r.shipTo)}${row("Contact / email", r.contact)}`;
+  const contactRow = r.contact
+    ? `<div class="check"><span class="dot ${r.contact.pass ? "ok" : "bad"}">${r.contact.pass ? "✓" : "✕"}</span>
+        <div class="txt"><span class="k">Contact / email</span><div class="sub">${esc(r.contact.detail || "")}</div></div></div>`
+    : "";
+  return `<div class="sec">Ship-to &amp; contact</div>${shipRow}${contactRow}`;
 }
 
 // The action row differs by disposition; buttons are a mock (no handlers).
@@ -204,6 +220,31 @@ function actions(disp) {
   return `<button class="btn" disabled>Resolve to continue</button>
         <button class="btn">Assign to me</button>`;
 }
+
+// The set of filter facets a card belongs to (disposition + each issue type present).
+// A card can carry several — it shows under every matching filter chip.
+function cardFacets(r) {
+  const f = new Set();
+  if (r.disposition) f.add(r.disposition); // order | quote | review
+  if (!r.rule1?.pass) f.add("customer");
+  if (r.shipTo && !r.shipTo.pass) f.add("shipto");
+  if (r.contact && !r.contact.pass) f.add("contact");
+  if (!(r.line_items || []).length) f.add("item");
+  if ((r.lines || []).some((l) => !l.rule2 || l.blockedFlag || l.uomFlag || l.qtyFlag || l.platingFlag)) f.add("item");
+  if ((r.lines || []).some((l) => l.priceFlag || l.bcPriceFlag)) f.add("price");
+  if (r.paymentReview?.review) f.add("payment");
+  if (r.customerBlocked) f.add("blocked");
+  if (r.requiresApproval) f.add("highvalue");
+  if (r.serviceReview?.required) f.add("special");
+  if (urgencyOf(r)) f.add("urgent");
+  return [...f];
+}
+const FILTERS = [
+  ["all", "All"], ["order", "Order"], ["quote", "Quote"], ["review", "Needs review"],
+  ["customer", "Customer"], ["shipto", "Ship-to"], ["item", "Item/part"], ["price", "Price"],
+  ["payment", "Payment"], ["blocked", "Cust. blocked"], ["highvalue", "Over $5k"],
+  ["special", "Special instr."], ["contact", "Contact"], ["urgent", "Urgent"],
+];
 
 export function card(r) {
   let [badge, cls] = BADGE[r.disposition] || BADGE.review;
@@ -241,7 +282,7 @@ export function card(r) {
   const urgent = urgencyOf(r);
   const urgentBanner = urgent ? `<div class="urgentbar">⏱ Action needed soon${urgent.hit ? ` — “${esc(urgent.hit)}”` : ""}</div>` : "";
 
-  return `<details class="card ${cls}${urgent ? " urgent" : ""}" data-cid="${esc(r.conversationId || r.id)}">
+  return `<details class="card ${cls}${urgent ? " urgent" : ""}" data-cid="${esc(r.conversationId || r.id)}" data-facets="${cardFacets(r).join(" ")}">
     <summary class="row">
       ${badge}${urgent ? '<span class="badge soon">⏱ SOON</span>' : ""}
       <div class="main">
@@ -281,6 +322,31 @@ export function card(r) {
   </details>`;
 }
 
+// Created orders whose acknowledgement email failed to send — a rep can resend each.
+function needsAckBlock(needsAck) {
+  if (!needsAck || !needsAck.length) return "";
+  const rows = needsAck.map((r) => {
+    const who = r.rule1?.match?.displayName || r.customer?.name || "—";
+    const num = r.bc_number ? `${esc(r.bc_docType === "quote" ? "Quote" : "Order")} ${esc(r.bc_number)}` : "";
+    return `<div class="ackrow" data-cid="${esc(r.conversationId || r.id)}">
+      <div class="g"><b>PO ${esc(r.po_number || "—")}</b> · ${esc(who)} · ${num}
+        <div class="sub">not sent — ${esc(r.ack?.reason || "unknown")}${r.customer?.contact_email ? ` · to ${esc(r.customer.contact_email)}` : ""}</div></div>
+      <button class="btn primary sm" data-act="resend-ack">Resend</button></div>`;
+  }).join("");
+  return `<div class="ackbox"><h3>⚠ ${needsAck.length} order(s) need acknowledgement — email didn't send</h3>${rows}</div>`;
+}
+
+// Filter chips (client-side) with a live count per facet. Chips with 0 are dimmed.
+function filterBar(records) {
+  const counts = { all: records.length };
+  for (const r of records) for (const f of cardFacets(r)) counts[f] = (counts[f] || 0) + 1;
+  const chips = FILTERS.map(([k, label]) => {
+    const c = counts[k] || 0;
+    return `<button class="chip${k === "all" ? " active" : ""}${c === 0 && k !== "all" ? " zero" : ""}" data-filter="${k}">${esc(label)} <span class="c">${c}</span></button>`;
+  }).join("");
+  return `<div class="filterbar">${chips}</div>`;
+}
+
 export function page(data, opts = {}) {
   const records = data.records || [];
   const interactive = !!opts.interactive; // served by the live server: wire the buttons
@@ -305,6 +371,13 @@ export function page(data, opts = {}) {
   .stat{flex:1;min-width:130px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
   .stat .n{font-size:26px;font-weight:700}.stat .l{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
   .stat.ok .n{color:var(--ok)}.stat.warn .n{color:var(--warn)}
+  .stat[data-filter]{cursor:pointer}.stat.active{outline:2px solid var(--accent);outline-offset:-1px}
+  .filterbar{display:flex;gap:6px;flex-wrap:wrap;margin:14px 0}
+  .chip{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:999px;padding:5px 12px;font-size:12.5px;cursor:pointer}
+  .chip:hover{border-color:var(--accent)}
+  .chip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .chip .c{opacity:.65;font-variant-numeric:tabular-nums}
+  .chip.zero{opacity:.4}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:10px;overflow:hidden}
   summary.row{display:flex;align-items:center;gap:12px;padding:13px 15px;cursor:pointer;list-style:none}
   summary.row::-webkit-details-marker{display:none}
@@ -360,16 +433,24 @@ export function page(data, opts = {}) {
   .card.done{opacity:.6}.card.done .badge{filter:grayscale(1)}
   .refresh{margin-left:auto;font:inherit;font-size:13px;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:6px 13px;cursor:pointer}
   .refresh:hover{border-color:var(--accent)} .topbar{display:flex;align-items:center;gap:10px;margin-top:8px}
+  .ackbox{background:var(--warn-bg);border:1px solid var(--urgent-bd);border-radius:12px;padding:12px 14px;margin:16px 0}
+  .ackbox h3{margin:0 0 8px;font-size:14px;color:var(--warn)}
+  .ackrow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px dashed var(--line);font-size:13px}
+  .ackrow:first-of-type{border-top:0}.ackrow .g{flex:1;min-width:0}
+  .ackrow .g .sub{color:var(--muted);font-size:12px}
+  .btn.sm{padding:5px 11px;font-size:12.5px}
   code{background:var(--chip);padding:1px 5px;border-radius:5px;font-size:12.5px}</style></head><body><div class="wrap">
 <header><h1>Order Review Queue</h1>
 <p>${interactive ? "Live" : "Prototype"} · orders read from the <code>orders@</code> mailbox, extracted, and checked against Business Central. ${records.length} order(s) · generated ${esc(when)}.</p></header>
 ${interactive ? '<div class="topbar"><button class="refresh" onclick="refreshQueue()">↻ Check for new mail</button><span id="rmsg" class="sub"></span></div>' : ""}
 <div class="banner"><b>Human-in-the-loop.</b><span>Nothing is written to BC without a rep's approval. Clean orders route to an <b>Order</b> (all in stock) or a <b>Quote</b> (some short); the rest need review. "Approve" here is a mock.</span></div>
 <div class="stats">
-  <div class="stat ok"><div class="n">${tally.order || 0}</div><div class="l">→ Create as Order</div></div>
-  <div class="stat quote"><div class="n">${tally.quote || 0}</div><div class="l">→ Create as Quote</div></div>
-  <div class="stat warn"><div class="n">${tally.review || 0}</div><div class="l">Needs review</div></div>
+  <div class="stat ok" data-filter="order"><div class="n">${tally.order || 0}</div><div class="l">→ Create as Order</div></div>
+  <div class="stat quote" data-filter="quote"><div class="n">${tally.quote || 0}</div><div class="l">→ Create as Quote</div></div>
+  <div class="stat warn" data-filter="review"><div class="n">${tally.review || 0}</div><div class="l">Needs review</div></div>
 </div>
+${filterBar(records)}
+${needsAckBlock(data.needsAck)}
 ${records.map(card).join("\n")}
 </div>
 ${interactive ? CLIENT_SCRIPT : ""}
@@ -398,6 +479,15 @@ document.addEventListener('click', async (e)=>{
     }catch(err){ if(res) res.textContent='Could not open PDF.'; }
     return;
   }
+  const resend = e.target.closest('[data-act="resend-ack"]');
+  if(resend){
+    const row = resend.closest('.ackrow'); const cid = row.dataset.cid;
+    resend.disabled=true; resend.textContent='Sending…';
+    const out = await post('/api/resend-ack',{conversationId:cid});
+    if(out.ok && out.sent){ row.innerHTML='<div class="g"><b>✅ Acknowledgement sent</b><div class="sub">to '+esc(out.to||'')+'</div></div>'; }
+    else { resend.disabled=false; resend.textContent='Resend'; const s=row.querySelector('.sub'); if(s) s.textContent='still not sent — '+esc(out.reason||'unknown'); }
+    return;
+  }
   const approve = e.target.closest('[data-act="approve"]');
   const confirmBtn = e.target.closest('[data-act="confirm-create"]');
   const cancelBtn = e.target.closest('[data-act="cancel-create"]');
@@ -406,6 +496,28 @@ document.addEventListener('click', async (e)=>{
   const change = e.target.closest('[data-act="change-customer"]');
 
   if(change){ const p = change.closest('details[data-cid]').querySelector('.custfix'); if(p){ p.hidden=!p.hidden; if(!p.hidden){ const i=p.querySelector('.csi'); if(i) i.focus(); } } return; }
+
+  const changeShip = e.target.closest('[data-act="change-shipto"]');
+  if(changeShip){
+    const card = changeShip.closest('details[data-cid]'); const box = card.querySelector('.shipfix'); if(!box) return;
+    box.hidden = !box.hidden; if(box.hidden) return;
+    const list = box.querySelector('.csresults'); list.innerHTML = '<div class="sm" style="color:var(--muted);font-size:12px">loading ship-to addresses…</div>';
+    try{
+      const j = await (await fetch('/api/shiptos?conversationId='+encodeURIComponent(card.dataset.cid))).json();
+      if(!j.ok || !j.results || !j.results.length){ list.innerHTML='<div class="sm" style="color:var(--muted);font-size:12px">no ship-to addresses on file for this customer</div>'; return; }
+      list.innerHTML = j.results.map(s=>'<button class="sugg" data-act="assign-shipto" data-code="'+esc(s.code)+'"><b>'+esc(s.code)+' — '+esc(s.name||'')+'</b><span class="sm">'+esc([s.address,s.city,s.state,s.postalCode].filter(Boolean).join(', '))+'</span></button>').join('');
+    }catch(err){ list.innerHTML='<div class="sm">could not load ship-to addresses</div>'; }
+    return;
+  }
+  const assignShip = e.target.closest('[data-act="assign-shipto"]');
+  if(assignShip){
+    const card = assignShip.closest('details[data-cid]'); const res = card.querySelector('.result');
+    res.hidden=false; res.textContent='Setting ship-to '+assignShip.dataset.code+' and re-checking…';
+    const out = await post('/api/assign-shipto',{conversationId:card.dataset.cid, code:assignShip.dataset.code});
+    if(out.ok){ res.textContent='Ship-to set → '+out.disposition+'. Reloading…'; setTimeout(()=>location.reload(),700); }
+    else res.textContent='Ship-to assign failed: '+(out.reason||'unknown');
+    return;
+  }
 
   if(assign){
     const card = assign.closest('details[data-cid]'); const res = card.querySelector('.result');
@@ -481,6 +593,18 @@ document.addEventListener('input', (e)=>{
     }catch(err){ box.innerHTML='<div class="sm">search error</div>'; }
   }, 300);
 });
+// Queue filter: chips + clickable stat tiles show/hide cards by facet. Single-select;
+// remembered across reloads (the app reloads after actions) via localStorage.
+function applyFilter(key){
+  document.querySelectorAll('[data-filter]').forEach(el=>el.classList.toggle('active', el.dataset.filter===key));
+  document.querySelectorAll('details.card').forEach(card=>{
+    const fac=(card.dataset.facets||'').split(' ');
+    card.style.display=(key==='all'||fac.indexOf(key)>=0)?'':'none';
+  });
+  try{ localStorage.setItem('queueFilter', key); }catch(e){}
+}
+document.addEventListener('click',(e)=>{ const f=e.target.closest('[data-filter]'); if(f) applyFilter(f.dataset.filter); });
+try{ const saved=localStorage.getItem('queueFilter'); if(saved && saved!=='all' && document.querySelector('[data-filter="'+saved+'"]')) applyFilter(saved); }catch(e){}
 </script>`;
 
 function main() {

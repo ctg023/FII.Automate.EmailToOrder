@@ -136,15 +136,16 @@ const conversationOf = (thread) =>
 // Verify an order, honoring (1) an existing rep assignment, else (2) a learned alias
 // (email domain / name), else (3) normal name-matching. Returns the verify result and
 // the customer assignment to persist (so preview/approve force the same customer).
-async function verifyWithAlias(order, existing) {
+async function verifyWithAlias(order, existing, shipToCode) {
+  const ship = shipToCode ? { forceShipTo: shipToCode } : {}; // keep a rep's ship-to pick across re-verifies
   if (existing?.number) {
-    return { res: await verifyOrder(order, { forceCustomer: { number: existing.number, displayName: existing.name } }), assigned: existing };
+    return { res: await verifyOrder(order, { forceCustomer: { number: existing.number, displayName: existing.name }, ...ship }), assigned: existing };
   }
   const a = lookupAlias({ email: order.customer?.contact_email, name: order.customer?.name });
   if (a) {
-    return { res: await verifyOrder(order, { forceCustomer: { number: a.number, displayName: a.name, via: a.via } }), assigned: { number: a.number, name: a.name } };
+    return { res: await verifyOrder(order, { forceCustomer: { number: a.number, displayName: a.name, via: a.via }, ...ship }), assigned: { number: a.number, name: a.name } };
   }
-  return { res: await verifyOrder(order), assigned: null };
+  return { res: await verifyOrder(order, ship), assigned: null };
 }
 
 // BC/Q number(s) referenced anywhere in a thread's subjects — for the price check.
@@ -426,14 +427,14 @@ async function cmdReverify() {
     const r = x.record;
     const order = { customer: r.customer, po_number: r.po_number, order_date: r.order_date, requested_ship_date: r.requested_ship_date, ship_to: r.ship_to, line_items: r.line_items, special_instructions: r.special_instructions, service_action_required: r.service_action_required, service_action_reason: r.service_action_reason, quote_refs: quoteRefsFromRecord(r) };
     try {
-      const { res, assigned } = await verifyWithAlias(order, r.customer_assigned);
+      const { res, assigned } = await verifyWithAlias(order, r.customer_assigned, r.shipto_assigned?.code);
       const was = x.disposition;
       r.rule1 = res.rule1; r.lines = res.lines; r.linesPass = res.linesPass;
       r.shipTo = res.shipTo; r.contact = res.contact; r.price = res.price;
       r.disposition = res.disposition; r.dispositionReason = res.dispositionReason; x.disposition = res.disposition;
       r.requiresApproval = res.requiresApproval; r.approvalReason = res.approvalReason;
       r.orderTotal = res.orderTotal; r.threshold = res.threshold; r.blockedLines = res.blockedLines;
-      r.paymentReview = res.paymentReview; r.customerBlocked = res.customerBlocked;
+      r.paymentReview = res.paymentReview; r.customerBlocked = res.customerBlocked; r.serviceReview = res.serviceReview;
       if (assigned) r.customer_assigned = { number: assigned.number, name: assigned.name };
       console.log(`  ${was === res.disposition ? " " : "→"} ${res.disposition.padEnd(6)} PO ${r.po_number} · ${r.customer?.name || ""}${was !== res.disposition ? `  (was ${was})` : ""}`);
     } catch (e) { console.log(`  ! ${r.po_number}: ${e.message}`); }
