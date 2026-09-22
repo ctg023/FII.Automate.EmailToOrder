@@ -169,7 +169,7 @@ function toRecord(thread, order, res, classification) {
     disposition: res.disposition, dispositionReason: res.dispositionReason,
     requiresApproval: res.requiresApproval, approvalReason: res.approvalReason,
     orderTotal: res.orderTotal, threshold: res.threshold, blockedLines: res.blockedLines,
-    paymentReview: res.paymentReview,
+    paymentReview: res.paymentReview, customerBlocked: res.customerBlocked, serviceReview: res.serviceReview,
     classification, conversation: conversationOf(thread), last_received: thread.last_received,
   };
 }
@@ -433,7 +433,7 @@ async function cmdReverify() {
       r.disposition = res.disposition; r.dispositionReason = res.dispositionReason; x.disposition = res.disposition;
       r.requiresApproval = res.requiresApproval; r.approvalReason = res.approvalReason;
       r.orderTotal = res.orderTotal; r.threshold = res.threshold; r.blockedLines = res.blockedLines;
-      r.paymentReview = res.paymentReview;
+      r.paymentReview = res.paymentReview; r.customerBlocked = res.customerBlocked;
       if (assigned) r.customer_assigned = { number: assigned.number, name: assigned.name };
       console.log(`  ${was === res.disposition ? " " : "→"} ${res.disposition.padEnd(6)} PO ${r.po_number} · ${r.customer?.name || ""}${was !== res.disposition ? `  (was ${was})` : ""}`);
     } catch (e) { console.log(`  ! ${r.po_number}: ${e.message}`); }

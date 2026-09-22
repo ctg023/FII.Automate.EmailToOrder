@@ -106,6 +106,13 @@ function holdBlock(r) {
   return bits.length ? `<div class="dupe">${bits.join("<br>")}</div>` : "";
 }
 
+// Customer Blocked (credit-hold) review label.
+function customerBlockedBlock(r) {
+  const b = r.customerBlocked;
+  if (!b) return "";
+  return `<div class="dupe">🚫 Customer is BLOCKED in BC (${esc(b.code)} — credit hold). Do not create without clearing it.</div>`;
+}
+
 // Payment-terms / payment-method review label (prepay terms, or term+fee method).
 function paymentBlock(r) {
   const p = r.paymentReview;
@@ -202,6 +209,7 @@ export function card(r) {
     </summary>
     <div class="detail">
       <div class="disporeason">${esc(r.dispositionReason || "")}</div>
+      ${customerBlockedBlock(r)}
       ${serviceBlock(r)}
       ${paymentBlock(r)}
       ${holdBlock(r)}

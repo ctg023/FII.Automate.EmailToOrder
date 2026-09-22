@@ -148,7 +148,7 @@ async function handle(req, res) {
       r.shipTo = res2.shipTo; r.contact = res2.contact;
       r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
       // Re-derived overlays for the newly-assigned customer (payment gate, high-value, blocked).
-      r.paymentReview = res2.paymentReview;
+      r.paymentReview = res2.paymentReview; r.customerBlocked = res2.customerBlocked;
       r.requiresApproval = res2.requiresApproval; r.approvalReason = res2.approvalReason;
       r.orderTotal = res2.orderTotal; r.threshold = res2.threshold; r.blockedLines = res2.blockedLines;
       r.customer_assigned = { number: customerNumber, name: customerName };

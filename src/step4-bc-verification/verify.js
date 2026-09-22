@@ -658,10 +658,14 @@ async function checkPayment(company, custNo) {
   const methodCode = pm.get(c.paymentMethodId) || null;
   const isPrepay = !!termsCode && REVIEW_TERMS_CODES.has(termsCode);
   const isTermsFee = !!methodCode && REVIEW_METHOD_CODES.has(methodCode);
+  // Customer Blocked status (credit hold). The standard API returns "_x0020_" (an encoded
+  // space) when NOT blocked, and "Ship" / "Invoice" / "All" when blocked.
+  const blockedCode = String(c.blocked || "").replace(/_x0020_/g, " ").trim();
+  const blocked = !!blockedCode;
   const reasons = [];
   if (isPrepay) reasons.push(`customer is on prepay terms (${termsCode})`);
   if (isTermsFee) reasons.push(`customer is on term + fee (payment method ${methodCode})`);
-  return { termsCode, methodCode, isPrepay, isTermsFee, review: reasons.length > 0, reason: reasons.length ? `${reasons.join(" and ")} — order needs review before creating` : null };
+  return { termsCode, methodCode, isPrepay, isTermsFee, blocked, blockedCode, review: reasons.length > 0, reason: reasons.length ? `${reasons.join(" and ")} — order needs review before creating` : null };
 }
 
 // Name-substring search over BC customers, for the review app's "search customer" box.
@@ -773,6 +777,10 @@ export async function verifyOrder(order, opts = {}) {
   // Payment gate — resolved customer on prepay terms / term+fee payment method → review.
   const pay = r1.pass ? await checkPayment(company, custNo) : null;
 
+  // Customer Blocked (credit-hold) gate — a resolved customer whose BC Blocked status is
+  // Ship / Invoice / All can't be sold to without a human.
+  const customerBlocked = pay?.blocked ? { code: pay.blockedCode } : null;
+
   // Special-instructions gate — the extractor judged that the PO carries an instruction
   // customer service must act on (call/confirm, payment change, hold, certs, routing…).
   const serviceReview = order.service_action_required === true
@@ -820,6 +828,8 @@ export async function verifyOrder(order, opts = {}) {
     disposition = "review"; dispositionReason = `customer not confidently matched — ${r1.detail}`;
   } else if (!gateParts) {
     disposition = "review"; dispositionReason = `${lines.length - resolved} of ${lines.length} line(s) not matched to a BC item`;
+  } else if (customerBlocked) {
+    disposition = "review"; dispositionReason = `customer is BLOCKED in BC (${customerBlocked.code} — credit hold) — order needs review before creating`;
   } else if (serviceReview) {
     disposition = "review"; dispositionReason = serviceReview.reason;
   } else if (pay?.review) {
@@ -872,7 +882,7 @@ export async function verifyOrder(order, opts = {}) {
     if (blockedLines.length) holds.push(`⚠ ${blockedLines.length} line(s) blocked in BC (${blockedLines.map((b) => b.item).slice(0, 3).join(", ")}) — excluded from the created doc`);
     if (holds.length) dispositionReason = `${dispositionReason} · ${holds.join(" · ")}`;
   }
-  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines, paymentReview: pay, serviceReview };
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines, paymentReview: pay, serviceReview, customerBlocked };
 }
 
 const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };
