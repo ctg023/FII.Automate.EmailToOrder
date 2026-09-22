@@ -20,6 +20,7 @@ import { spawn } from "node:child_process";
 import { createDoc } from "../step6-order-creation/create.js";
 import { verifyOrder, searchCustomers } from "../step4-bc-verification/verify.js";
 import { setAlias } from "./aliases.js";
+import { acknowledge } from "./acknowledge.js";
 import { page } from "./render.js";
 import { bcqNumbers } from "./thread-merge.js";
 
@@ -182,6 +183,13 @@ async function handle(req, res) {
         entry.record.status = "actioned"; entry.record.bc_number = out.number; entry.record.bc_docType = out.docType;
         entry.record.bc_url = bcLink(out.docType, out.number);
         if (out.approvedBy) entry.record.approved_by = out.approvedBy; // audit: who signed off
+        // Order acknowledgement to the customer. Composes always; SENDS only when ACK_SEND=1
+        // + a recipient exists (see acknowledge.js). A send problem never fails the create.
+        try {
+          const ack = await acknowledge(entry.record, out);
+          entry.record.ack = { sent: !!ack.sent, to: ack.to || null, subject: ack.subject || null, reason: ack.reason || null, at: new Date().toISOString() };
+          out.ack = entry.record.ack;
+        } catch (e) { out.ack = { sent: false, reason: `ack error: ${e.message}` }; }
         saveStore(store);
         out.url = entry.record.bc_url;
       }

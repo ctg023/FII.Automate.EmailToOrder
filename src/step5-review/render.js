@@ -27,12 +27,42 @@ import { pathToFileURL } from "node:url";
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const n = (x) => (x == null ? "" : Number(x).toLocaleString("en-US"));
+const usd = (x) => (Number.isFinite(Number(x)) ? `$${Number(x).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—");
 
 const BADGE = {
   order: ['<span class="badge ok">→ ORDER</span>', "order"],
   quote: ['<span class="badge quote">→ QUOTE</span>', "quote"],
   review: ['<span class="badge warn">NEEDS REVIEW</span>', "review"],
 };
+
+// "Action needed soon" detection — an explicit urgency term, or a stated deadline of
+// ≤ 2 days (24h / 48h / 1–2 days / next-day / by tomorrow). Scans the email subject/body,
+// notes and the CS-action reason. Pure render-time cue (no cost, backfills existing cards).
+const URGENT_TERMS = /\b(asap|urgent(?:ly)?|immediate(?:ly)?|expedit\w*|rush|right\s+away|right\s+now|end\s+of\s+day|eod|by\s+(?:today|tomorrow|end\s+of\s+day))\b/i;
+const URGENT_DEADLINE = /\bwithin\s+(?:24|48)\s*(?:hours?|hrs?)\b|\b(?:24|48)\s*(?:hours?|hrs?)\b|\bwithin\s+(?:1|2|one|two)\s+(?:business\s+)?days?\b|\b(?:1|2|one|two)\s+(?:business\s+)?days?\b|\bnext[-\s]?day\b|\bby\s+tomorrow\b/i;
+// The full sentence around a match index, so the banner shows the customer's actual
+// request ("Please confirm price and delivery within 24 hours") not just the keyword.
+function sentenceAround(text, idx, matchLen, cap = 240) {
+  const before = text.slice(0, idx);
+  const start = Math.max(before.lastIndexOf("."), before.lastIndexOf("!"), before.lastIndexOf("?"),
+    before.lastIndexOf("\n"), before.lastIndexOf("\r")) + 1;
+  const rest = text.slice(idx + matchLen);
+  const rel = rest.search(/[.!?\n\r]/);
+  const end = rel === -1 ? text.length : idx + matchLen + rel + 1;
+  let s = text.slice(start, end).replace(/\s+/g, " ").trim();
+  if (s.length > cap) s = s.slice(0, cap - 1).trimEnd() + "…";
+  return s;
+}
+function urgencyOf(r) {
+  const parts = [];
+  for (const m of r.conversation || []) parts.push(m.subject || "", m.body_text || "");
+  parts.push(r.special_instructions || "", r.service_action_reason || "");
+  const text = parts.join("\n");
+  const m = text.match(URGENT_TERMS) || text.match(URGENT_DEADLINE);
+  if (!m) return null;
+  const sentence = sentenceAround(text, m.index, m[0].length);
+  return { hit: sentence || String(m[0]).replace(/\s+/g, " ").trim() };
+}
 
 // A single "did you mean" candidate button.
 function suggestionBtn(s) {
@@ -46,17 +76,28 @@ function suggestionBtn(s) {
 // One line-item check row. Green ✓ only when the line is genuinely ready: resolved,
 // in stock, AND no blocking quantity/UoM problem. A resolved+in-stock line whose
 // quantity isn't safe to create (not a multiple of 100, or a multiplier UoM) shows ✕.
-function lineRow(l) {
+function lineRow(l, poLine) {
   const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag && !l.platingFlag && !l.blockedFlag;
   const state = ok ? "ok" : "bad";
   const mark = ok ? "✓" : l.rule2 ? "✕" : "!";
   const priceNote = l.priceNote ? `<div class="sub">${l.priceFlag ? "⚠ " : ""}${esc(l.priceNote)}</div>` : "";
   const blockedNote = l.blockedFlag ? `<div class="sub" style="color:var(--bad);font-weight:600">⛔ Item ${esc(l.item || "")} is BLOCKED in BC — this line is excluded from the created doc.</div>` : "";
+  // The customer's price ON THE PO, shown prominently so a rep can confirm it (esp. when
+  // the email says "confirm price"). "Our price" isn't reliably available pre-create; the
+  // referenced-quote comparison (Rule 6) still appears above as priceNote when present.
+  const num = (v) => (v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null); // NB: Number(null)===0, so guard first
+  const price = poLine ? num(poLine.unit_price) : null;
+  const qty = poLine ? num(poLine.quantity) : null;
+  const ext = price != null && qty != null ? price * qty : (poLine ? num(poLine.line_total) : null);
+  const priceLine = price != null
+    ? `<div class="poprice">PO price: <b>${usd(price)}</b>/ea${qty != null ? ` × ${n(qty)}` : ""}${ext != null ? ` = <b>${usd(ext)}</b>` : ""}</div>`
+    : (poLine ? `<div class="poprice none">No price on the PO for this line</div>` : "");
   return `<div class="check">
       <span class="dot ${state}">${mark}</span>
       <div class="txt">
         <span class="k">${esc(l.label)}</span>
         <div class="sub">${esc(l.detail)}</div>
+        ${priceLine}
         ${priceNote}
         ${blockedNote}
       </div></div>`;
@@ -194,12 +235,15 @@ export function card(r) {
     : "";
 
   const lineRows = lineCount
-    ? (r.lines || []).map(lineRow).join("")
+    ? (r.lines || []).map((l, i) => lineRow(l, r.line_items?.[i])).join("")
     : `<div class="check"><span class="dot bad">!</span><div class="txt"><span class="k">No line items extracted</span><div class="sub">Order body/attachment produced no lines — needs a rep.</div></div></div>`;
 
-  return `<details class="card ${cls}" data-cid="${esc(r.conversationId || r.id)}">
+  const urgent = urgencyOf(r);
+  const urgentBanner = urgent ? `<div class="urgentbar">⏱ Action needed soon${urgent.hit ? ` — “${esc(urgent.hit)}”` : ""}</div>` : "";
+
+  return `<details class="card ${cls}${urgent ? " urgent" : ""}" data-cid="${esc(r.conversationId || r.id)}">
     <summary class="row">
-      ${badge}
+      ${badge}${urgent ? '<span class="badge soon">⏱ SOON</span>' : ""}
       <div class="main">
         <div class="po">PO ${esc(r.po_number || "—")} · ${esc(custName)}</div>
         <div class="cust">${custLine}</div>
@@ -208,6 +252,7 @@ export function card(r) {
       <span class="chev">▸</span>
     </summary>
     <div class="detail">
+      ${urgentBanner}
       <div class="disporeason">${esc(r.dispositionReason || "")}</div>
       ${customerBlockedBlock(r)}
       ${serviceBlock(r)}
@@ -225,8 +270,9 @@ export function card(r) {
       </div>
       ${customerFix}
       ${shipContactBlock(r)}
-      <div class="sec">Line items — part match &amp; stock</div>
+      <div class="sec">Line items — part match, stock &amp; PO price</div>
       ${lineRows}
+      ${Number.isFinite(Number(r.orderTotal)) ? `<div class="pototal">PO total (from line prices): <b>${usd(r.orderTotal)}</b></div>` : ""}
       <div class="actions">
         ${actions(r.disposition)}
       </div>
@@ -245,10 +291,10 @@ export function page(data, opts = {}) {
 <style>
   :root{--bg:#f4f5f7;--panel:#fff;--ink:#1c2230;--muted:#606a7b;--line:#e4e8ef;--accent:#2563eb;
     --ok:#16a34a;--ok-bg:#e9f8ef;--warn:#b45309;--warn-bg:#fdf3e3;--bad:#dc2626;--chip:#eef1f6;
-    --quote:#2563eb;--quote-bg:#e8effc;}
+    --quote:#2563eb;--quote-bg:#e8effc;--urgent-bg:#fdecec;--urgent-bd:#f0b4b4;}
   @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1319;--panel:#171c25;--ink:#e8ecf3;
     --muted:#9aa5b6;--line:#262d39;--accent:#3b82f6;--ok:#34d399;--ok-bg:#0f2a1f;--warn:#fbbf24;--warn-bg:#2a2110;--bad:#f87171;--chip:#222a36;
-    --quote:#60a5fa;--quote-bg:#12233f;}}
+    --quote:#60a5fa;--quote-bg:#12233f;--urgent-bg:#2a1517;--urgent-bd:#5c2b2b;}}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
   .wrap{max-width:900px;margin:0 auto;padding:20px 16px 80px}
@@ -265,6 +311,12 @@ export function page(data, opts = {}) {
   .badge{font-size:11px;font-weight:700;padding:4px 9px;border-radius:999px;white-space:nowrap}
   .badge.ok{background:var(--ok-bg);color:var(--ok)}.badge.warn{background:var(--warn-bg);color:var(--warn)}
   .badge.quote{background:var(--quote-bg);color:var(--quote)}
+  .badge.soon{background:var(--bad);color:#fff}
+  .card.urgent{background:var(--urgent-bg);border-color:var(--urgent-bd)}
+  .urgentbar{background:var(--bad);color:#fff;border-radius:8px;padding:7px 11px;font-size:12.5px;font-weight:600;margin:0 0 8px}
+  .poprice{font-size:13px;margin-top:3px;font-variant-numeric:tabular-nums}
+  .poprice.none{color:var(--muted);font-style:italic}
+  .pototal{margin-top:8px;font-size:13.5px;text-align:right;font-variant-numeric:tabular-nums}
   .stat.quote .n{color:var(--quote)}
   .btn.primary.quote{background:var(--quote);border-color:var(--quote)}
   .disporeason{font-size:12.5px;color:var(--muted);margin:-2px 0 6px;font-style:italic}
@@ -400,7 +452,11 @@ document.addEventListener('click', async (e)=>{
     const out = await post('/api/approve',{conversationId:card.dataset.cid, allowDuplicate: confirmBtn.dataset.dup==='true', approver: approver||undefined});
     if(out.ok && out.created){
       const num = out.url ? '<a href="'+out.url+'" target="_blank" rel="noopener"><b>'+esc(out.number)+'</b></a>' : '<b>'+esc(out.number)+'</b>';
-      res.innerHTML='✅ Created '+esc(out.docType)+' '+num+' in '+esc(out.company)+' (open, not released). You can close this.';
+      let ackLine = '';
+      if(out.ack){ ackLine = out.ack.sent
+        ? '<div class="sub">✉ Acknowledgement sent to '+esc(out.ack.to)+'.</div>'
+        : '<div class="sub">✉ Acknowledgement composed'+(out.ack.to?' for '+esc(out.ack.to):'')+' — not sent ('+esc(out.ack.reason||'')+').</div>'; }
+      res.innerHTML='✅ Created '+esc(out.docType)+' '+num+' in '+esc(out.company)+' (open, not released). You can close this.'+ackLine;
       card.classList.add('done'); const a=card.querySelector('[data-act="approve"]'); if(a) a.disabled=true;
     } else { res.textContent='Not created: '+(out.reason||'unknown'); }
     return;

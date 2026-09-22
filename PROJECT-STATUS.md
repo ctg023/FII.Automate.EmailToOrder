@@ -49,6 +49,42 @@ Live-backlog hardening from working real orders in the review app:
   referenced quotes (228k) aren't in the test restore (prod-only); the check reports "not in this company"
   and does not gate — so a **prod smoke-test** is the only remaining validation.
 
+### New review gates (2026-09-21)
+A batch of additional "don't auto-process this" gates, built from real-order review. Each routes to
+**review** (or, for high-value, unlocks with a sign-off) and shows a **labeled banner** on the card.
+The BC-derived gates backfill onto the existing queue with a free `pipeline.js --reverify`; the
+extraction-derived one (special instructions) needs a **re-extract** to populate existing cards (new mail
+gets it automatically).
+- **High-value → second sign-off (create-time gate).** A PO whose total (`Σ qty×unit_price`) is at/over
+  **`REVIEW_OVER`** (default **$5,000**) — or that can't be totaled because a line has no price
+  (**`REVIEW_NO_PRICE`**, on by default) — can't be created without a **second approver** entered in the
+  confirm panel. `createDoc` refuses the write without it (stage `approval`); the name is recorded
+  (`approved_by`). Doc type (order/quote) is preserved; the requirement is an overlay, shown as a
+  "REVIEW · 2ND SIGN-OFF" badge. ⚠️ **Not identity-verified** (free-text, no server auth yet) — an honest
+  second sign-off, not enforced separation of duties. Real enforcement waits on the server-auth item.
+- **Blocked item (BC item `Blocked`).** A line resolving to a blocked item is **excluded** from the created
+  doc (the rest of the PO still creates); if **every** line is blocked → review ("nothing to create").
+- **Customer Blocked (credit hold).** A resolved customer whose BC `Blocked` = **Ship / Invoice / All**
+  → review. (Detection strips the standard API's `_x0020_` = not-blocked; any remaining value is a hold.)
+- **Payment gate.** Resolved customer on a **prepay Payment Terms** code (**`REVIEW_TERMS_CODES`**, default
+  `PREPAY`) or a **term+fee Payment Method** (**`REVIEW_METHOD_CODES`**, default `TERMS+FEE` = "Terms
+  Payment + Bank Fee") → review. Terms code is on the customer's Payment Terms; the fee is on the Payment
+  **Method** (id→code maps cached; customer select now pulls `paymentTermsId`/`paymentMethodId`).
+- **Available-to-sell stock (Rule 3 changed).** Stock check now compares **available = `Inventory −
+  Qty on Sales Order`** (committed to other open orders), not raw on-hand — read together from the classic
+  `Item_Card_Excel` page (the standard `items` API exposes only on-hand). Disposition model unchanged:
+  all lines available → Order; any short → Quote. Line detail reads "available N (on-hand X − on-order Y)".
+  NB: many items are **oversold** (negative available) in the current data, so expect more quotes.
+- **Special instructions needing CS action (model-judged).** Extraction now sets **`service_action_required`**
+  + `service_action_reason` by judging the whole order (body, notes, freight terms, line descriptions) —
+  open-ended: call/confirm, credit-card/pricing change, hold / no-partials, certs/PPAP, special routing, etc.,
+  while ignoring standing constraints ("cartons ≤ 50 lbs"). True → review. (Only gate that needs a re-extract
+  to backfill existing cards.)
+- **PDF links open in the default viewer.** `📎` links now hit `/api/open-pdf`, which launches the saved PDF
+  in the host's default PDF app (path validated under `out/pdfs`), instead of forcing a download. **Local-use
+  convenience** — it opens on the machine running `server.js`; remote (GlobalProtect) reps would need an
+  in-browser renderer instead.
+
 ## Where we are
 Working through the brief's build order. **Steps 1–3 done. Step 4 in progress:** BC connectivity
 proven, live data-quality probe run, and a **read-only v1 verification gate (`verify.js`) works
@@ -75,10 +111,13 @@ orders are NOT routed per salesperson** (so customer `salespersonCode` coverage 
 `Mail.Read.Shared` only). Consequence: the pipeline must track already-processed emails in its OWN state
 store (keyed by Graph message-id), since we can't move or flag them to mark "done" ·
 **scope = clean the PO + get it into BC as the right document** (NOT replicating the 10 ARC web-order
-auto-release rules — those were reviewed and set aside). Two gates need a human: (1) customer not matched
-with high certainty, (2) any line not resolved to a BC item. Otherwise **stock routes the document type:
-all lines in stock → Order; any short line → whole PO as a Quote** (option A). Actual create stays a later,
-human-approved, sandbox-first write.
+auto-release rules — those were reviewed and set aside). Core gates that need a human: (1) customer not
+matched with high certainty, (2) any line not resolved to a BC item — plus the added gates (customer/item
+**Blocked**, **prepay / term+fee** payment, **special instructions** needing CS action, **multi-PO**, UoM /
+qty-multiple, plating, quote-price mismatch) and the **high-value ≥ $5,000** second-sign-off. Otherwise
+**stock routes the document type: all lines available → Order; any short line → whole PO as a Quote**
+(option A) — where **available = on-hand − qty on sales order**, not raw on-hand. Actual create stays a
+later, human-approved, sandbox-first write.
 
 ## Recommended (not yet confirmed — decide at review-app stage)
 - **Web app hosting:** IIS reverse proxy → standalone Node Windows service (not `iisnode`). Fallback: Node serves HTTPS directly.
