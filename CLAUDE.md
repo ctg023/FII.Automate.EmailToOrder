@@ -10,8 +10,12 @@ created in BC. Goal: cut manual order entry for ~10 reps while keeping a human i
 
 **A human approves every order before it is created in BC. No auto-create — ever, at least through rollout.**
 
-## Status (2026-09-21)
+## Status (2026-09-22)
 See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed status — keep that current too.
+> **"Gate"** = a pass/fail checkpoint in `verify.js` that decides if an order can be auto-created or must
+> stop for a human. **Hard gate** → routes to **Needs review**, not creatable until resolved. **Soft/overlay
+> gate** → flagged but still creatable under a condition (e.g. the >$5k second sign-off, or a blocked line
+> that's just excluded). Disposition is **Order** (all lines available) / **Quote** (some short) / **review**.
 - **Step 1 (sample set):** done — 50 labeled sample emails in `samples/` (29 order, 8 ambiguous, 13 not_order).
 - **Step 2 (extraction):** done — harness in `src/step2-extraction/`; ~100% on order content. Now also sends
   **native PDF bytes** as document blocks (`buildMessageContent`), so real/scanned PDFs are read directly.
@@ -21,7 +25,12 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   (direct / cross-ref via `Item_References_Excel`, then two fallbacks for messy part fields —
   **part-field prefix**: real part + crammed description words, e.g. `HS3 M6 PROJECTION WELD NUT`→`HS3 M6`;
   and **description-anchored**: clean part in the description when the part field carries a tag, e.g.
-  `RW2114OHIO`→`RW-2114`; both require a unique BC match) · **3** stock · **4** ship-to matches a `ShipTo` on file
+  `RW2114OHIO`→`RW-2114`; both require a unique BC match) · **3** stock — **PER-LOCATION available** (on-hand
+  from `Item_Ledger_Entries_Excel` `Remaining_Quantity` **minus** open sales-order qty from `Sales_Lines_Excel`
+  `Outstanding_Quantity`, summed by `Location_Code`). The gate uses the **customer's ship-from location**
+  (customer-card `Location_Code`); short there → Quote **even if another branch has stock** (no location →
+  company total). Each line shows `CL/CH/AT` available (the customer's own location starred), tunable via
+  `STOCK_LOCATIONS` · **4** ship-to matches a `ShipTo` on file
   (hard gate) · **5** contact/email matches a Person contact under the customer's company contact
   (`Contact`/`ContactBusinessRelation`; **informational unless `CONTACT_GATE=1`**) · **6** price matches the
   **referenced BC quote** — extract the **BC/Q #** from the subject and read its item unit prices from the
@@ -35,9 +44,25 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   item number** (e.g. "black oxide" → `SSM 05014-P44`, "copper flash" → `-P40`, "zinc yellow" → `-P17`).
   "plain / no plate" keeps the base; **bare "zinc"** (several zinc variants) or any unresolved finish → review
   with candidate variants. Explicit `-P##` on the PO is used directly.
+  · **8** **PO price vs BC PRICE LIST** — reads `Price_List_Lines_Excel` (customer-specific lines `Source_Type`
+  `Customer` + base tiers `Source_Type` `All Customers`; sales lines have `Unit_Price`>0, purchase/`Vendor` don't).
+  Replicates BC's default **Lowest-Price "Get Price"**: among every line the customer is eligible for, matching
+  UoM/currency/date with `Minimum_Quantity` ≤ ordered qty, take the **lowest** — i.e. customer price if lower,
+  else the applicable **All-Customers quantity break**. Mismatch → review (exact by default, `PRICE_TOL`). A
+  referenced quote (Rule 6) still wins for lines it priced. (Customer **Price Group** tier exists in code but 0
+  customers use one. There is NO usable read-only "Get Price" before create — the standard API only fills the
+  price when a line is POSTed.)
   Also gates: non-piece **UoM** (100PACK/M/C → review), **piece quantity not a multiple of 100** (fasteners
-  ship in hundreds; e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), and **multi-PO-in-one-email** →
-  review. `--batch <dir> --json <out>` emits records.
+  ship in hundreds; e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), **multi-PO-in-one-email** → review,
+  **high-value** (PO total ≥ `REVIEW_OVER` = $5,000, or un-totalable when `REVIEW_NO_PRICE` — needs a **second
+  sign-off** at create, an overlay not a hard block), **blocked item** (BC item `Blocked` → line **excluded**
+  from the created doc; all lines blocked → review), **customer Blocked** (credit hold Ship/Invoice/All → review),
+  **payment** (customer prepay Payment **Terms** in `REVIEW_TERMS_CODES`=PREPAY, or term+fee Payment **Method**
+  in `REVIEW_METHOD_CODES`=TERMS+FEE → review), and **special instructions** (extractor sets
+  `service_action_required`; verify gates ONLY genuine CS actions — payment/credit-card change, certs/test
+  reports, partial/split-ship or hold, price/qty discrepancy — the routine "acknowledge/confirm price &
+  delivery" ask does NOT gate, the acknowledgement email + urgency flag cover it). `--batch <dir> --json <out>`
+  emits records.
 - **Step 5 (review app):** **LIVE, end-to-end.**
   - `pipeline.js` — live runner: pulls `order@` Inbox, groups messages into **threads by conversationId**
     (Inbox-only — reps reply from their own mailboxes, so Sent isn't captured), classify→extract(w/ PDFs)→
@@ -62,6 +87,23 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     because Graph **default message ids can rotate** — CONFIRMS an id-"gone" with a content `$search`
     (`inboxContains`) before removing, so a rotated id never drops a present order. Runs inside `--run` and
     `--reconcile`; standalone `--reconcile-mailbox`. (Still read-only — it prunes the local store, not the mailbox.)
+  - **Ship-to picker:** a **change** link on the Ship-to row lists the customer's on-file `ShipTo` addresses
+    (`listShipTos` → `/api/shiptos`); picking one (`/api/assign-shipto`, `forceShipTo`) clears the ship-to gate
+    and is kept across re-verifies. On create, a **post-create classic-page PATCH** sets the established
+    `Ship_to_Code` on `Sales_Order_Excel`/`Sales_Quote_Excel` (the standard API has no `shipToCode` — address
+    fields are written as a safe fallback if the PATCH fails). ⚠️ PATCH not yet validated on a real create.
+  - **Order acknowledgement email** (`acknowledge.js`): on Approve→create the app composes a brief receipt and,
+    when `ACK_SEND=1`, **sends it from `order@` via Graph `Mail.Send`**. Recipient = the PO's buyer email (NOT
+    BC's scrubbed contact); `ACK_TEST_TO` redirects EVERY send to one address for testing (currently `navl@`).
+    Safe by default (compose-only until `ACK_SEND=1` + a recipient). A send failure never fails the create.
+    **Needs-acknowledgement view** at the top of the queue surfaces created orders whose ack failed (`ack.sent
+    =false`, dry-runs excluded) with a **Resend** button (`/api/resend-ack`) — so a send failure isn't lost.
+  - **Queue filters:** a client-side chip bar + clickable stat tiles filter cards by facet (Order/Quote/Review,
+    Customer, Ship-to, Item/part, Price, Payment, Cust. blocked, Over $5k, Special instr., Contact, Urgent) with
+    live counts, remembered across reloads. **Urgency flag:** cards with an urgency term or a ≤2-day deadline get
+    a light-red background + a banner quoting the customer's request sentence. **Per-line PO price** (unit ×
+    qty = extended, 5-decimal) and **PO total** shown on each card. **PDF links** open in the host's default
+    viewer (`/api/open-pdf`, local-use).
   - Commands: `pipeline.js --run` (process new mail; also reconciles) · `--merge-preview` (show split-PO merges,
     free) · `--reverify` (re-apply rules to cache, no Claude) · `--enrich` (dup-check + save PDFs) · `--reconcile`
     (BC-deleted back to queue + mailbox reconcile) · `--reconcile-mailbox` · `--rerender`. `server.js` serves the app.
@@ -77,20 +119,27 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   `itemAttachment` (message/rfc822) whose real PDF is nested one level down is pulled via a nested `$expand`
   (`fetchItemAttachmentFiles`), so those PDFs reach extraction. ⚠️ **Application Access Policy fence NOT yet
   applied** (app can read ALL mailboxes) — must do before pilot.
+- **Acknowledgement email LIVE:** `Mail.Send` granted; `ACK_SEND=1` with `ACK_TEST_TO=navl@buckeyefasteners.com`
+  so test sends don't hit real customers (a real test send to `navl@` succeeded). **Before prod:** remove
+  `ACK_TEST_TO` to email real buyers. `.env` is git-ignored so these settings must be re-set on the VM.
 - Accuracy pass **done** (found+fixed UoM, multi-PO, PDF-folder collision). Live backlog processed (full 188
   Inbox → ~85 real orders). **Open decisions:** (1) enable `CONTACT_GATE=1`? (works now; email match needs
   prod) (2) build the **mailbox move-on-approve** cleanup (needs `Mail.ReadWrite`)? (3) server **auth**,
   mailbox **Access Policy fence**, deploy the **EMAILORDER codeunit** — all before pilot. Backlog idea:
   item-level quote history / rate-shopping (see PROJECT-STATUS).
-- **Open date items (discussed, NOT built):** (a) **header Shipment Date** — the API can't write it, so it
-  reads BC's work date, not the requested date; fix options: a post-create **re-validate PATCH** to make BC
-  recalc it (untested), a **classic `Sales_Order_Excel` PATCH**, or a **BC API extension** exposing
-  `shipmentDate` (bundle with the dev handoff). (b) **Two dates (requested + required)** — POs sometimes carry
-  both under varied labels, but extraction captures only **one** (`requested_ship_date`); plan: add a second
-  extracted field + surface it, and write the "required" date to BC (e.g. Promised Delivery Date) once the API
-  extension exists. (c) **Established Ship-To vs Custom Address** — create writes the ship-to *address* fields
-  (shows as "Custom Address") rather than selecting the matched **Ship-to Code**; revisit so it uses the
-  established Ship-To.
+- **Not built (deferred, noted for a new session):** (a) **empty-thread guard** — the pipeline can create a
+  phantom card from a null/empty message (message id null, no content, stored under key `"undefined"`); one was
+  purged by hand. Guard: skip threads with a null id or no subject/body/attachments before classify/extract.
+  (b) **bare-PO-number merge** — `thread-merge.js` only keys on a BC/Q # or a PO token that follows a "PO"/"P.O."
+  marker, so customers whose subject is JUST the number (e.g. Bunn `4600000421`) don't merge and show as
+  duplicate cards. Fix: also treat a whole-subject strong token (≥6 chars, has a digit) as a PO key.
+- **Open date items:** (a) **header Shipment Date** — the standard API can't write it, BUT the classic
+  `Sales_Order_Excel` page **does** expose `Shipment_Date` (and `Ship_to_Code`), so the **same post-create PATCH
+  mechanism now used for Ship_to_Code** can set it — not yet wired. (b) **Two dates (requested + required)** —
+  POs sometimes carry both under varied labels, but extraction captures only **one** (`requested_ship_date`);
+  plan: add a second extracted field + surface it, and write the "required" date to BC once wired. (c)
+  **Established Ship-To vs Custom Address** — now **built** via the ship-to picker + a post-create classic
+  `Ship_to_Code` PATCH (address fields as fallback); ⚠️ the PATCH is **not yet validated on a real create**.
 
 ## Stack & architecture
 - **Node.js (ESM)** throughout. No build step; run `.js` directly with `node`.
@@ -107,8 +156,10 @@ src/step2-extraction/     # extraction harness (schema.js, extract.js, score.js,
 src/step3-classification/ # order/not_order/unsure classifier (same shape)
 src/step4-bc-verification/# ping.js (connectivity), data-quality.js, verify.js (read-only rules + disposition)
 src/step5-review/         # LIVE review app: pipeline.js (ingest→classify→extract→verify→cache),
-                          #   render.js (page), server.js (serves page + approve/preview/refresh endpoints),
-                          #   thread-merge.js (fold split-PO threads into one card; MERGE_THREADS=1)
+                          #   render.js (page+filters), server.js (serves page + approve/preview/assign/
+                          #   assign-shipto/shiptos/resend-ack/open-pdf endpoints), thread-merge.js (fold
+                          #   split-PO threads; MERGE_THREADS=1), acknowledge.js (order ack email via Mail.Send),
+                          #   aliases.js (learned customer aliases)
 src/step6-order-creation/ # create.js = BC Sales Order / Quote write; createDoc()/docExists() exported for server
 bc-extension/             # AL codeunit + README for the EMAILORDER number series (developer handoff)
 docs/                     # Email-Order-Review-Guide.pdf (rep-facing user guide)
@@ -159,6 +210,12 @@ Reminder: `create.js --create` (Step 6) is the only thing that WRITES to BC; the
 - **API key must be workspace-scoped** (Anthropic Console "Buckeye Auto Order" workspace). If an org key is
   used instead, set `ANTHROPIC_WORKSPACE_ID`. Key lives in `.env`.
 - Cost discipline: estimate first (`--estimate`), run one sample before `--all`, print $ after each run.
+- **Tuning env vars** (all `.env`, all optional): `PRICE_TOL` (price-match $ tolerance, 0=exact) · `QTY_STEP`
+  (piece multiple, 100) · `CONTACT_GATE` (1 = hard-gate contact) · `MERGE_THREADS` (1 = split-PO merge) ·
+  `REVIEW_OVER` (high-value threshold, 5000) · `REVIEW_NO_PRICE` (gate un-totalable POs, on) · `REVIEW_TERMS_CODES`
+  (prepay Payment Terms, PREPAY) · `REVIEW_METHOD_CODES` (term+fee Payment Method, TERMS+FEE) · `STOCK_LOCATIONS`
+  (per-line stock columns, `CL,CH,AT`) · `AVAIL_TTL_MS` (per-item stock/price cache, 60000) · `ACK_SEND` (1 =
+  really send the acknowledgement) · `ACK_TEST_TO` (redirect all acks here for testing) · `ACK_FROM_NAME`.
 
 ## Environment gotchas (must persist on the VM too)
 - **Corporate TLS inspection** breaks npm, Claude API, and BC calls with `SELF_SIGNED_CERT_IN_CHAIN`.
@@ -184,8 +241,15 @@ Reminder: `create.js --create` (Step 6) is the only thing that WRITES to BC; the
   against prod.
 - **BC OData services used** (classic `/ODataV4`, published pages — NOT standard API v2.0):
   `Item_References_Excel` (customer part → item), `ShipTo` (Customer_No + Code + address), `Contact` +
-  `ContactBusinessRelation`. **Customers' buyers are Person `Contact`s linked by `Company_No`** to the
-  customer's company contact (found via `ContactBusinessRelation`). Order creation uses standard API v2.0.
+  `ContactBusinessRelation`, `Item_Card_Excel` (plating `ARC_Plating_Desc`), `Sales_Quote_Excel`/`Sales_Order_Excel`
+  (+`…SalesLines`, referenced-quote prices; and `Ship_to_Code`/`Shipment_Date` for the post-create PATCH),
+  `Price_List_Lines_Excel` (customer + All-Customers price tiers, **Rule 8**), `Item_Ledger_Entries_Excel`
+  (`Remaining_Quantity` per location) + `Sales_Lines_Excel` (`Outstanding_Quantity` per location) for **per-location
+  stock**, `Customer_Card_Excel` (`Location_Code`, `Currency_Code`, `Customer_Price_Group`). Standard API v2.0
+  is used for `customers`/`items` and order **creation** — but has **no `shipToCode` and no header `shipmentDate`**
+  (why the classic-page PATCH exists), and price is only filled when a line is POSTed (no read-only "Get Price").
+  **Customers' buyers are Person `Contact`s linked by `Company_No`** to the customer's company contact (found via
+  `ContactBusinessRelation`).
 - **Mailbox cleanup is the primary goal** (reps spend all day managing `order@`). Plan (decided, NOT built):
   on **Approve→create**, move that thread's emails to an **"Entered in BC"** folder; leave everything else for
   reps. Needs **`Mail.ReadWrite`** (escalation from `Mail.Read`) + the Access Policy fence FIRST. This flips the

@@ -471,8 +471,33 @@ async function availabilityOf(company, itemNo, fallbackOnHand = 0) {
   return rec;
 }
 
+// Per-LOCATION availability for an item: on-hand (Item Ledger Remaining_Quantity, only
+// entries still holding stock) minus open sales-order qty (Sales Lines Outstanding_Quantity),
+// summed by Location_Code. Available-to-sell AT a location = on-hand(loc) − on-sales-order(loc).
+// The company totals reconcile with the item-card flowfields. Cached per item.
+const LOCAVAIL_CACHE = new Map(); // itemNo(upper) -> { at, byLoc:{LOC:{onHand,onSO,avail}}, ok }
+async function locationAvailability(company, itemNo) {
+  const key = stripSD(itemNo);
+  const hit = LOCAVAIL_CACHE.get(key);
+  if (hit && Date.now() - hit.at < AVAIL_TTL) return hit;
+  const C = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const byLoc = {};
+  const at = (L) => (byLoc[L] || (byLoc[L] = { onHand: 0, onSO: 0 }));
+  const ile = await getAll(encodeURI(`${C}/Item_Ledger_Entries_Excel?$filter=Item_No eq ${odataStr(itemNo)} and Remaining_Quantity ne 0&$select=Location_Code,Remaining_Quantity`));
+  const sl = await getAll(encodeURI(`${C}/Sales_Lines_Excel?$filter=Type eq 'Item' and No eq ${odataStr(itemNo)} and Document_Type eq 'Order'&$select=Location_Code,Outstanding_Quantity`));
+  if (ile.ok) for (const r of ile.rows) at((r.Location_Code || "").toUpperCase()).onHand += Number(r.Remaining_Quantity || 0);
+  if (sl.ok) for (const r of sl.rows) at((r.Location_Code || "").toUpperCase()).onSO += Number(r.Outstanding_Quantity || 0);
+  for (const v of Object.values(byLoc)) v.avail = v.onHand - v.onSO;
+  const rec = { at: Date.now(), byLoc, ok: ile.ok };
+  LOCAVAIL_CACHE.set(key, rec);
+  return rec;
+}
+// Locations shown on each line (the customer's own ship-from location is always included
+// and highlighted by the renderer). Env-tunable.
+const STOCK_LOCATIONS = (process.env.STOCK_LOCATIONS || "CL,CH,AT").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
+
 // Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then availability.
-async function checkLine(company, line, custNo, notes) {
+async function checkLine(company, line, custNo, notes, custLoc) {
   const supplier = (line.supplier_part || "").trim();
   const customer = (line.customer_part || "").trim();
   const qty = line.quantity;
@@ -548,9 +573,22 @@ async function checkLine(company, line, custNo, notes) {
   if (qty == null) {
     return { label, pass: false, rule2: true, item: item.number, blockedFlag, detail: `resolved to ${item.number} (via ${via}) but order has no quantity to verify${blockedText}` };
   }
-  const av = await availabilityOf(company, item.number, item.inventory);
-  const onHand = av.onHand, onOrder = av.onSalesOrder, available = av.available;
+  // Per-location availability; the stock GATE uses the customer's ship-from location
+  // (their Location Code). If the customer has no location, fall back to the company total.
+  const la = await locationAvailability(company, item.number);
+  const byLoc = la.byLoc;
+  const totals = Object.values(byLoc).reduce((a, v) => ({ onHand: a.onHand + v.onHand, onSO: a.onSO + v.onSO }), { onHand: 0, onSO: 0 });
+  const fallbackAvail = la.ok ? totals.onHand - totals.onSO : (Number(item.inventory ?? 0)); // if ILE read failed
+  const gateLoc = custLoc && byLoc !== null ? custLoc : null;
+  const at = gateLoc ? (byLoc[gateLoc] || { onHand: 0, onSO: 0, avail: 0 }) : null;
+  const onHand = at ? at.onHand : totals.onHand;
+  const onOrder = at ? at.onSO : totals.onSO;
+  const available = at ? at.avail : fallbackAvail;
   const enough = available >= qty;
+  // Per-location cells for the card (the three configured locations + always the gate loc).
+  const showLocs = [...new Set([...(gateLoc ? [gateLoc] : []), ...STOCK_LOCATIONS])];
+  const locStock = showLocs.map((L) => ({ loc: L, avail: (byLoc[L]?.avail ?? 0), onHand: (byLoc[L]?.onHand ?? 0), onSO: (byLoc[L]?.onSO ?? 0) }));
+  const locCells = locStock.map((c) => `${c.loc}${c.loc === gateLoc ? "*" : ""}: ${c.avail}`).join("  ");
   const uomFlag = uomNeedsReview(line.uom, item.baseUnitOfMeasureCode);
   const qtyFlag = qtyNeedsReview(qty, uomFlag);
   const uomNote = uomFlag
@@ -560,10 +598,12 @@ async function checkLine(company, line, custNo, notes) {
     ? ` [⚠ quantity ${qty} is not a multiple of ${QTY_STEP} pieces — confirm before creating]`
     : "";
   const platingText = platingNote ? ` [${platingFlag ? "⚠ " : ""}${platingNote}]` : "";
+  const availLabel = gateLoc ? `avail @${gateLoc} ${available}` : `available ${available} (all locations)`;
   return {
     label, pass: enough, rule2: true, item: item.number, via, uomFlag, qtyFlag, platingFlag, platingNote, platingCandidates, blockedFlag,
-    onHand, onOrder, available,
-    detail: `${item.number} (via ${via}) — available ${available} (on-hand ${onHand} − on-order ${onOrder}) vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}${platingText}${blockedText}`,
+    onHand, onOrder, available, gateLoc, locStock,
+    detail: `${item.number} (via ${via}) — ${availLabel} vs ordered ${qty}${enough ? " ✓" : " — SHORT"}${uomNote}${qtyNote}${platingText}${blockedText}`,
+    locCells, // "CL*: n  CH: n  AT: n" for the CLI report
   };
 }
 
@@ -799,9 +839,9 @@ async function customerPricing(company, custNo) {
   const hit = CUSTMETA.get(custNo);
   if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit;
   const C = `${ODBASE}/Company(${odataStr(company.name)})`;
-  const r = await get(encodeURI(`${C}/Customer_Card_Excel?$filter=No eq ${odataStr(custNo)}&$select=No,Currency_Code,Customer_Price_Group`));
+  const r = await get(encodeURI(`${C}/Customer_Card_Excel?$filter=No eq ${odataStr(custNo)}&$select=No,Currency_Code,Customer_Price_Group,Location_Code`));
   const row = r.json?.value?.[0] || {};
-  const rec = { currency: (row.Currency_Code || "").toUpperCase(), priceGroup: row.Customer_Price_Group || "", at: Date.now() };
+  const rec = { currency: (row.Currency_Code || "").toUpperCase(), priceGroup: row.Customer_Price_Group || "", location: (row.Location_Code || "").toUpperCase(), at: Date.now() };
   CUSTMETA.set(custNo, rec);
   return rec;
 }
@@ -898,9 +938,10 @@ export async function verifyOrder(order, opts = {}) {
     r1 = await checkCustomer(company, order, { rows: await allCustomers(company) });
   }
   const custNo = r1.match?.number || null; // resolved customer #, sharpens cross-ref
+  const custLoc = custNo ? (await customerPricing(company, custNo)).location || null : null; // ship-from location
   const lines = [];
   const orderNotes = order.notes ?? order.special_instructions ?? "";
-  for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo, orderNotes));
+  for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo, orderNotes, custLoc));
 
   // Rule 6 — price match against the referenced BC quote (exact by default). Sets
   // per-line priceFlag/priceNote; a mismatch gates to review below.

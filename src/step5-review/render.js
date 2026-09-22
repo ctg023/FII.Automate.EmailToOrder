@@ -84,6 +84,10 @@ function lineRow(l, poLine) {
   const priceNote = l.priceNote ? `<div class="sub">${l.priceFlag ? "⚠ " : ""}${esc(l.priceNote)}</div>` : "";
   const bcPriceNote = l.bcPriceNote ? `<div class="sub">${l.bcPriceFlag ? "⚠ " : ""}${esc(l.bcPriceNote)}</div>` : "";
   const blockedNote = l.blockedFlag ? `<div class="sub" style="color:var(--bad);font-weight:600">⛔ Item ${esc(l.item || "")} is BLOCKED in BC — this line is excluded from the created doc.</div>` : "";
+  // Per-location available stock (customer's ship-from location bold/starred = the one the gate uses).
+  const locLine = (l.locStock && l.locStock.length)
+    ? `<div class="locstock">Available — ${l.locStock.map((c) => `<span class="${c.loc === l.gateLoc ? "gateloc" : ""}">${esc(c.loc)}${c.loc === l.gateLoc ? "★" : ""}: ${n(c.avail)}</span>`).join(" · ")}</div>`
+    : "";
   // The customer's price ON THE PO, shown prominently so a rep can confirm it (esp. when
   // the email says "confirm price"). "Our price" isn't reliably available pre-create; the
   // referenced-quote comparison (Rule 6) still appears above as priceNote when present.
@@ -99,6 +103,7 @@ function lineRow(l, poLine) {
       <div class="txt">
         <span class="k">${esc(l.label)}</span>
         <div class="sub">${esc(l.detail)}</div>
+        ${locLine}
         ${priceLine}
         ${priceNote}
         ${bcPriceNote}
@@ -387,6 +392,8 @@ export function page(data, opts = {}) {
   .badge.soon{background:var(--bad);color:#fff}
   .card.urgent{background:var(--urgent-bg);border-color:var(--urgent-bd)}
   .urgentbar{background:var(--bad);color:#fff;border-radius:8px;padding:7px 11px;font-size:12.5px;font-weight:600;margin:0 0 8px}
+  .locstock{font-size:12.5px;margin-top:3px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .locstock .gateloc{color:var(--ink);font-weight:700}
   .poprice{font-size:13px;margin-top:3px;font-variant-numeric:tabular-nums}
   .poprice.none{color:var(--muted);font-style:italic}
   .pototal{margin-top:8px;font-size:13.5px;text-align:right;font-variant-numeric:tabular-nums}
