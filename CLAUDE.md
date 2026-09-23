@@ -57,6 +57,11 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   referenced quote (Rule 6) still wins for lines it priced. (Customer **Price Group** tier exists in code but 0
   customers use one. There is NO usable read-only "Get Price" before create — the standard API only fills the
   price when a line is POSTed.)
+  **Shipping/freight lines** (a PO "SHIPPING CHARGE" / "FREIGHT" line, matched by `FREIGHT_TERMS` — a part-less
+  short charge label, not a stock item) are detected and **excluded from the item/stock gate** so they don't force
+  review; on create they ride onto the BC doc as a **Charge (Item)** line (`FREIGHT_ITEM_NO`, default `FREIGHT-OUT`
+  — the No. used on this instance) with the PO's stated amount (often $0/TBD, set later by BC/shipping). ⚠️ the
+  Charge-line create path is **not yet validated on a real create**.
   Also gates: non-piece **UoM** (100PACK/M/C → review), **piece quantity not a multiple of 100** (fasteners
   ship in hundreds; e.g. 2120/2150 → review, tune/disable via `QTY_STEP`), **multi-PO-in-one-email** → review,
   **high-value** (PO total ≥ `REVIEW_OVER` = $5,000, or un-totalable when `REVIEW_NO_PRICE` — needs a **second
@@ -237,7 +242,9 @@ Reminder: `create.js --create` (Step 6) is the only thing that WRITES to BC; the
   `REVIEW_OVER` (high-value threshold, 5000) · `REVIEW_NO_PRICE` (gate un-totalable POs, on) · `REVIEW_TERMS_CODES`
   (prepay Payment Terms, PREPAY) · `REVIEW_METHOD_CODES` (term+fee Payment Method, TERMS+FEE) · `STOCK_LOCATIONS`
   (per-line stock columns, `CL,CH,AT`) · `AVAIL_TTL_MS` (per-item stock/price cache, 60000) · `ACK_SEND` (1 =
-  really send the acknowledgement) · `ACK_TEST_TO` (redirect all acks here for testing) · `ACK_FROM_NAME`.
+  really send the acknowledgement) · `ACK_TEST_TO` (redirect all acks here for testing) · `ACK_FROM_NAME` ·
+  `FREIGHT_TERMS` (regex for shipping/freight charge lines) · `FREIGHT_ITEM_NO` (BC Charge (Item) No. for freight,
+  default `FREIGHT-OUT`).
 
 ## Environment gotchas (must persist on the VM too)
 - **Corporate TLS inspection** breaks npm, Claude API, and BC calls with `SELF_SIGNED_CERT_IN_CHAIN`.

@@ -567,6 +567,25 @@ async function locationAvailability(company, itemNo) {
 // and highlighted by the renderer). Env-tunable.
 const STOCK_LOCATIONS = (process.env.STOCK_LOCATIONS || "CL,CH,AT").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 
+// Shipping/freight (and similar) CHARGE lines: not a stock item, so they must NOT gate on
+// part-match or stock. On create they go on the BC doc as a Charge (Item) line (No. =
+// FREIGHT_ITEM_NO, "FREIGHT-OUT" on this instance). Both tunable via .env.
+const FREIGHT_TERMS = new RegExp(
+  process.env.FREIGHT_TERMS || "\\b(freight|shipping|ship(?:ping)?\\s*(?:charge|cost|fee)|handling|cartage|delivery\\s*charge|fuel\\s*surcharge|surcharge|misc(?:ellaneous)?\\s*charge)\\b",
+  "i",
+);
+const FREIGHT_ITEM_NO = process.env.FREIGHT_ITEM_NO || "FREIGHT-OUT";
+// A line is a freight/charge line when it carries no real part number (or the part field is
+// itself a charge word) AND the text reads as a shipping/freight charge. Guards against a
+// real item that merely mentions "shipping" by requiring the part field to be empty/charge-y.
+function isFreightLine(line) {
+  const part = `${line.customer_part || ""} ${line.supplier_part || ""}`.replace(/\s+/g, " ").trim();
+  if (part && !FREIGHT_TERMS.test(part)) return false;          // has a real part number → a stock item, not freight
+  const text = `${part} ${line.description || ""}`.replace(/\s+/g, " ").trim();
+  if (!FREIGHT_TERMS.test(text)) return false;                  // nothing charge-like in it
+  return text.split(" ").filter(Boolean).length <= 6;          // a charge LABEL, not a long product description
+}
+
 // Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then availability.
 // forceLocation (rep-picked ship-from branch) overrides the customer's default location
 // for the stock GATE — a line short at the customer's branch can become creatable when
@@ -576,6 +595,17 @@ async function checkLine(company, line, custNo, notes, custLoc, forceLocation) {
   const customer = (line.customer_part || "").trim();
   const qty = line.quantity;
   const label = supplier || customer || line.description || `line ${line.line_no ?? "?"}`;
+
+  // Freight/charge line — not an inventory item. Don't gate it on part-match or stock; it
+  // rides onto the created doc as the FREIGHT-OUT Charge (Item) with the PO's stated amount
+  // (often 0/TBD, which BC/shipping fills). rule2/pass true so it's transparent to the gates.
+  if (isFreightLine(line)) {
+    const amount = Number(line.unit_price) || Number(line.line_total) || 0;
+    return {
+      label, chargeLine: true, chargeNo: FREIGHT_ITEM_NO, chargeAmount: amount, rule2: true, pass: true,
+      detail: `shipping/freight charge — added to the BC doc as ${FREIGHT_ITEM_NO}${amount ? ` ($${amount.toFixed(2)})` : " (amount set by BC/shipping)"}`,
+    };
+  }
 
   // Rule 2, path (a) DIRECT — try supplier PN, then customer PN, then a vendor P/N
   // mined from the description, each as our items.number (whitespace/-/-insensitive).
@@ -1056,7 +1086,7 @@ export async function verifyOrder(order, opts = {}) {
   const priceUnknownLines = []; // PO has a price but we can't determine ours → review
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
-    if (!l.rule2 || l.blockedFlag) continue; // only lines that will be created
+    if (!l.rule2 || l.blockedFlag || l.chargeLine) continue; // only real item lines; freight priced separately
     const poPrice = Number(order.line_items?.[i]?.unit_price);
     if (!Number.isFinite(poPrice) || poPrice <= 0) { l.priceDirective = "no-po-price"; continue; } // nothing to compare
     const our = l.quotePriced ? l.quotePrice : (Number.isFinite(l.bcListPrice) ? l.bcListPrice : null);

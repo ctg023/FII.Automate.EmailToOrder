@@ -98,6 +98,13 @@ function buildDoc(order, res) {
   const lines = res.lines
     .map((l, i) => {
       if (l.blockedFlag) return null; // item blocked in BC — excluded from the created doc
+      // Freight/charge line → BC Charge (Item) (e.g. FREIGHT-OUT) with the PO's amount.
+      if (l.chargeLine) {
+        const ln = { lineType: "Charge", lineObjectNumber: l.chargeNo, quantity: 1 };
+        if (Number.isFinite(l.chargeAmount) && l.chargeAmount > 0) ln.unitPrice = l.chargeAmount;
+        if (delivery) ln.shipmentDate = delivery;
+        return ln;
+      }
       const ln = { lineType: "Item", lineObjectNumber: l.item, quantity: order.line_items?.[i]?.quantity };
       if (delivery) ln.shipmentDate = delivery; // Shipment Date matches the requested delivery date
       return ln;

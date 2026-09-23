@@ -98,9 +98,12 @@ function lineRow(l, poLine, idx) {
   // a Quote. Mark it distinctly (blue 📄) so it doesn't read as a clean ✓ that "should be an
   // order" — the reason the doc isn't an order lives on this line.
   const forcesQuote = l.priceDirective === "higher";
-  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !priceUnknown && !forcesQuote && !l.platingFlag && !l.blockedFlag;
-  const state = ok ? "ok" : forcesQuote ? "quote" : "bad";
-  const mark = ok ? "✓" : forcesQuote ? "📄" : l.rule2 ? "✕" : "!";
+  // A freight/charge line isn't an inventory item — it never gates; it rides onto the doc
+  // as the FREIGHT-OUT charge. Show it neutrally (🚚), not as a failed item line.
+  const charge = !!l.chargeLine;
+  const ok = charge || (l.pass && !l.qtyFlag && !l.uomFlag && !priceUnknown && !forcesQuote && !l.platingFlag && !l.blockedFlag);
+  const state = charge ? "charge" : ok ? "ok" : forcesQuote ? "quote" : "bad";
+  const mark = charge ? "🚚" : ok ? "✓" : forcesQuote ? "📄" : l.rule2 ? "✕" : "!";
   // Keep BOTH prices visible (PO price shown separately below; these are the "our price"
   // comparison notes from Rules 6/8). No manual control — the direction drives routing.
   const priceNote = l.priceNote ? `<div class="sub">${esc(l.priceNote)}</div>` : "";
@@ -475,7 +478,7 @@ export function page(data, opts = {}) {
   .detail{border-top:1px solid var(--line);padding:14px 15px}
   .check{display:flex;gap:9px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:13.5px}.check:last-of-type{border-bottom:0}
   .dot{margin-top:2px;flex:none;width:16px;height:16px;border-radius:50%;font-size:11px;line-height:16px;text-align:center;color:#fff}
-  .dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.quote{background:var(--quote)}
+  .dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.quote{background:var(--quote)}.dot.charge{background:var(--muted)}
   .txt{flex:1}.txt .k{font-weight:600}.sub{color:var(--muted);font-size:12.5px}.part{font-variant-numeric:tabular-nums}
   .sec{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:12px 0 4px}
   .actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
