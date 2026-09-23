@@ -118,6 +118,12 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     **our ≈ PO** → match; **PO priced but our price undeterminable** (item on no price list, no referenced quote)
     → **review** (`priceUnknown`). Both prices stay **visible** on the card (per-line PO price + the our-price
     note from Rules 6/8, plus a directional note). No manual price override — the direction decides.
+  - **Item quote history:** a per-line **"recent quotes for this item (4 wks)"** toggle (resolved items only)
+    lazy-loads (`/api/quote-history` → `recentQuotesForItem`) a cross-customer table of recent quotes for that
+    item — **open quotes** (`Sales_Quote_Excel`+lines) **plus** quotes already **converted to orders**
+    (`Sales_Order_Excel` rows carrying a `Quote_No`, since this instance keeps no quote archive). Shows date ·
+    customer · qty · unit price · doc · status; read-only, cached 5 min/item, exact item No, window via `?weeks=`.
+    Surfaces rate-shopping (same part quoted to multiple distributors) and recent pricing.
   - **Order acknowledgement email** (`acknowledge.js`): on Approve→create the app composes a brief receipt and,
     when `ACK_SEND=1`, **sends it from `order@` via Graph `Mail.Send`**. Recipient = the PO's buyer email (NOT
     BC's scrubbed contact); `ACK_TEST_TO` redirects EVERY send to one address for testing (currently `navl@`).

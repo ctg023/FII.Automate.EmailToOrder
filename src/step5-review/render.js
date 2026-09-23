@@ -128,6 +128,11 @@ function lineRow(l, poLine, idx) {
   const priceLine = price != null
     ? `<div class="poprice">PO price: <b>${uprice(price)}</b>/ea${qty != null ? ` × ${n(qty)}` : ""}${ext != null ? ` = <b>${usd(ext)}</b>` : ""}</div>`
     : (poLine ? `<div class="poprice none">No price on the PO for this line</div>` : "");
+  // Item-level quote history (all customers, 4 wks) — lazy-loaded on click. Only for a
+  // resolved BC item (not a freight/charge line).
+  const qhLink = (l.item && !l.chargeLine)
+    ? `<div class="sub"><button class="changelink qh-toggle" data-act="quote-history" data-item="${esc(l.item)}">▸ recent quotes for this item (4 wks)</button><div class="qhbox" hidden></div></div>`
+    : "";
   return `<div class="check">
       <span class="dot ${state}">${mark}</span>
       <div class="txt">
@@ -138,6 +143,7 @@ function lineRow(l, poLine, idx) {
         ${priceNote}
         ${bcPriceNote}
         ${priceDir}
+        ${qhLink}
         ${blockedNote}
       </div></div>`;
 }
@@ -468,6 +474,11 @@ export function page(data, opts = {}) {
   .shipfrom .sugg.loc{flex-direction:row;gap:6px}
   .shipfrom .sugg.loc[aria-current="true"]{border-color:var(--accent);font-weight:600}
   .locfix{margin-top:6px}
+  .qhbox{margin-top:6px}
+  table.qh{border-collapse:collapse;font-size:12px;width:100%;font-variant-numeric:tabular-nums}
+  table.qh th{text-align:left;color:var(--muted);font-weight:600;border-bottom:1px solid var(--line);padding:3px 8px 3px 0}
+  table.qh td{padding:3px 8px 3px 0;border-bottom:1px solid var(--line)}
+  table.qh td.num{text-align:right}
   .dir-lower{color:var(--ok);font-weight:600}
   .dir-higher{color:var(--quote);font-weight:600}
   .dir-unknown{color:var(--bad);font-weight:600}
@@ -545,6 +556,24 @@ document.addEventListener('click', async (e)=>{
       if(r.ok){ if(res) res.textContent='Opened '+name+' in your default PDF viewer.'; }
       else if(res){ res.textContent='Could not open PDF: '+(r.reason||'unknown'); }
     }catch(err){ if(res) res.textContent='Could not open PDF.'; }
+    return;
+  }
+  const qh = e.target.closest('[data-act="quote-history"]');
+  if(qh){
+    const box = qh.parentElement.querySelector('.qhbox');
+    box.hidden = !box.hidden;
+    qh.textContent = (box.hidden?'▸':'▾')+' recent quotes for this item (4 wks)';
+    if(box.hidden || box.dataset.loaded) return;
+    box.innerHTML='<div class="sm" style="color:var(--muted);font-size:12px">loading…</div>';
+    try{
+      const j = await (await fetch('/api/quote-history?item='+encodeURIComponent(qh.dataset.item)+'&weeks=4')).json();
+      if(!j.ok){ box.innerHTML='<div class="sm">lookup failed: '+esc(j.reason||'unknown')+'</div>'; return; }
+      if(!j.results.length){ box.innerHTML='<div class="sm" style="color:var(--muted);font-size:12px">no quotes for this item in the last 4 weeks</div>'; box.dataset.loaded='1'; return; }
+      box.innerHTML='<table class="qh"><thead><tr><th>Date</th><th>Customer</th><th>Qty</th><th>Unit</th><th>Doc</th><th>Status</th></tr></thead><tbody>'+
+        j.results.map(r=>'<tr><td>'+esc((r.date||'').slice(0,10))+'</td><td>'+esc(r.customer)+'</td><td class="num">'+Number(r.qty||0).toLocaleString()+'</td><td class="num">'+(r.unitPrice?'$'+Number(r.unitPrice).toFixed(5):'—')+'</td><td>'+esc(r.docNo)+'</td><td>'+esc(r.status)+'</td></tr>').join('')+
+        '</tbody></table>';
+      box.dataset.loaded='1';
+    }catch(err){ box.innerHTML='<div class="sm">could not load quote history</div>'; }
     return;
   }
   const resend = e.target.closest('[data-act="resend-ack"]');

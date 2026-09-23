@@ -734,6 +734,61 @@ export async function listShipTos(custNo) {
   return rows.map((r) => ({ code: r.Code, name: r.Name, address: r.Address, address2: r.Address_2, city: r.City, state: r.County, postalCode: r.Post_Code, contact: r.Contact, email: r.E_Mail }));
 }
 
+// Item-level quote history across ALL customers, last `weeks` weeks — for the review
+// card's "have we already quoted this?" panel. Combines OPEN quotes (Sales_Quote pages)
+// with quotes already CONVERTED to orders (Sales_Order rows carrying a Quote_No, since BC
+// keeps no quote archive here). Read-only; cached 5 min per item. Returns newest-first
+// [{date, customer, qty, unitPrice, docNo, status}].
+const QH_CACHE = new Map();
+export async function recentQuotesForItem(itemNo, { weeks = 4 } = {}) {
+  if (!itemNo) return [];
+  const key = `${stripSD(itemNo)}|${weeks}`;
+  const hit = QH_CACHE.get(key);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.rows;
+  const company = await resolveCompany();
+  const C = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const cutoff = new Date(Date.now() - weeks * 7 * 24 * 3600 * 1000);
+  const within = (d) => { const x = new Date(d); return !isNaN(x) && x >= cutoff; };
+  const headerFilter = (nos) => nos.slice(0, 60).map((n) => `No eq ${odataStr(n)}`).join(" or ");
+  const uniq = (a) => [...new Set(a.filter(Boolean))];
+  const out = [];
+
+  // (1) OPEN quotes for this item.
+  const ql = await getAll(encodeURI(`${C}/Sales_Quote_ExcelSalesLines?$filter=Type eq 'Item' and No eq ${odataStr(itemNo)}&$select=Document_No,Quantity,Unit_Price&$top=200`));
+  const qNos = uniq((ql.rows || []).map((r) => r.Document_No));
+  const qHead = {};
+  if (qNos.length) {
+    const h = await getAll(encodeURI(`${C}/Sales_Quote_Excel?$filter=${headerFilter(qNos)}&$select=No,Document_Date,Order_Date,Sell_to_Customer_Name`));
+    for (const r of h.rows || []) qHead[r.No] = r;
+  }
+  for (const l of ql.rows || []) {
+    const hd = qHead[l.Document_No]; if (!hd) continue;
+    const date = hd.Document_Date || hd.Order_Date;
+    if (!within(date)) continue;
+    out.push({ date, customer: hd.Sell_to_Customer_Name || "", qty: Number(l.Quantity) || 0, unitPrice: Number(l.Unit_Price) || 0, docNo: l.Document_No, status: "open quote" });
+  }
+
+  // (2) Quotes CONVERTED to orders — the order keeps the originating Quote_No.
+  const ol = await getAll(encodeURI(`${C}/Sales_Order_ExcelSalesLines?$filter=Type eq 'Item' and No eq ${odataStr(itemNo)}&$select=Document_No,Quantity,Unit_Price&$top=200`));
+  const oNos = uniq((ol.rows || []).map((r) => r.Document_No));
+  const oHead = {};
+  if (oNos.length) {
+    const h = await getAll(encodeURI(`${C}/Sales_Order_Excel?$filter=${headerFilter(oNos)}&$select=No,Document_Date,Order_Date,Sell_to_Customer_Name,Quote_No`));
+    for (const r of h.rows || []) oHead[r.No] = r;
+  }
+  for (const l of ol.rows || []) {
+    const hd = oHead[l.Document_No]; if (!hd || !hd.Quote_No) continue; // only orders that came from a quote
+    const date = hd.Document_Date || hd.Order_Date;
+    if (!within(date)) continue;
+    out.push({ date, customer: hd.Sell_to_Customer_Name || "", qty: Number(l.Quantity) || 0, unitPrice: Number(l.Unit_Price) || 0, docNo: l.Document_No, status: `ordered (Q${hd.Quote_No})` });
+  }
+
+  out.sort((a, b) => new Date(b.date) - new Date(a.date));
+  const rows = out.slice(0, 20);
+  QH_CACHE.set(key, { rows, at: Date.now() });
+  return rows;
+}
+
 // Rule 4 — does the PO ship-to match one of the customer's ship-to addresses on file?
 // Match = same postal code AND (same city or same street number). Returns the matched
 // row so create can copy its address.

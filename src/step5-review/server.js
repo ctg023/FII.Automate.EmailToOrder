@@ -18,7 +18,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve, normalize, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { createDoc } from "../step6-order-creation/create.js";
-import { verifyOrder, searchCustomers, listShipTos } from "../step4-bc-verification/verify.js";
+import { verifyOrder, searchCustomers, listShipTos, recentQuotesForItem } from "../step4-bc-verification/verify.js";
 import { setAlias } from "./aliases.js";
 import { acknowledge } from "./acknowledge.js";
 import { page } from "./render.js";
@@ -192,6 +192,15 @@ async function handle(req, res) {
       saveStore(store);
       return json(res, 200, { ok: true, sent: r.ack.sent, to: r.ack.to, reason: r.ack.reason });
     } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
+
+  // Item quote history (all customers, last N weeks) for the per-line "have we quoted this?" panel.
+  if (req.method === "GET" && p === "/api/quote-history") {
+    const item = url.searchParams.get("item");
+    const weeks = Number(url.searchParams.get("weeks")) || 4;
+    if (!item) return json(res, 400, { ok: false, reason: "no item" });
+    try { return json(res, 200, { ok: true, item, weeks, results: await recentQuotesForItem(item, { weeks }) }); }
+    catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
   }
 
   // List the (resolved) customer's ship-to addresses for the "change ship-to" picker.
