@@ -114,6 +114,14 @@ const MATCH = {
 };
 
 const emailDomain = (e) => ((e || "").split("@")[1] || "").toLowerCase().trim();
+// Domains that must NOT unify two different customers in the contact tiebreak: our own
+// (forwarded-internally POs and scrubbed test data all read "…@buckeyefasteners.com") and
+// shared free-mail providers (many unrelated buyers share gmail.com, etc.).
+const NONSPECIFIC_DOMAINS = new Set([
+  "buckeyefasteners.com", "fastenerind.com",
+  "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com",
+  "comcast.net", "sbcglobal.net", "att.net", "verizon.net", "msn.com", "live.com",
+]);
 
 // Light stem: drop a trailing plural "s" so fastener/fasteners, product/products match.
 const stem = (t) => (t.length > 3 && t.endsWith("s") && !t.endsWith("ss") ? t.slice(0, -1) : t);
@@ -219,7 +227,8 @@ async function checkCustomer(company, order, custCache) {
     return { rule: "1 customer", pass: false, detail: `no exact BC customer for "${order?.customer?.name}"`, suggestions: suggestCustomers(order, wantTokens, custCache.rows) };
   }
 
-  // Tie-break on ship-to city/state when several candidates qualify.
+  // Tie-break on ship-to city/state when several candidates qualify (free — uses the
+  // candidate cards already in hand, so try it first).
   let brokeBy = null;
   if (pool.length > 1 && MATCH.geoTieBreak) {
     const oCity = normGeo(order?.ship_to?.city), oState = normGeo(order?.ship_to?.state);
@@ -228,11 +237,73 @@ async function checkCustomer(company, order, custCache) {
       if (geo.length === 1) { pool = geo; brokeBy = "ship-to city/state"; }
     }
   }
+  // Still ambiguous → use the PO buyer's identity (email/domain in prod, name now) to pick
+  // the one candidate that carries this buyer as a contact. A handful of BC reads, only on
+  // the tied candidates, and only when geo didn't already resolve it.
+  if (pool.length > 1) {
+    const ct = await contactTieBreak(company, order, pool);
+    if (ct) { pool = [ct.match]; brokeBy = ct.via; }
+  }
   if (pool.length > 1) {
     const suggestions = pool.slice(0, 4).map((c) => ({ ...c, shared: wantTokens.length, of: wantTokens.length, geo: normGeo(c.city) === normGeo(order?.ship_to?.city) }));
     return { rule: "1 customer", pass: false, detail: `ambiguous — ${pool.length} customers match; pick one`, suggestions };
   }
   return { rule: "1 customer", pass: true, detail: `resolved to ${pool[0].number} (${pool[0].displayName}) [via ${via}${brokeBy ? ` + ${brokeBy}` : ""}]`, match: pool[0] };
+}
+
+// All contact identities for a customer: the customer-level email plus every Person
+// contact under the customer's company contact (ContactBusinessRelation → Contact).
+// Shared by Rule 5 (checkContact) and the Rule-1 contact tiebreak. Returns emails as a
+// lowercased Set and people as [{no, name, email}].
+async function contactsForCustomer(company, custNo) {
+  const ODC = `${ODBASE}/Company(${odataStr(company.name)})`;
+  const emails = new Set();
+  const people = [];
+  const cr = await get(`companies(${company.id})/customers?$filter=number eq ${odataStr(custNo)}&$select=email`);
+  const custEmail = String(cr.json?.value?.[0]?.email || "").toLowerCase().trim();
+  if (custEmail) emails.add(custEmail);
+  const rel = await get(encodeURI(`${ODC}/ContactBusinessRelation?$filter=No eq ${odataStr(custNo)}&$select=Contact_No,Link_to_Table`));
+  const companyContactNo = (rel.json?.value || []).find((x) => /customer/i.test(x.Link_to_Table || ""))?.Contact_No;
+  if (companyContactNo) {
+    const res = await getAll(encodeURI(`${ODC}/Contact?$filter=Company_No eq ${odataStr(companyContactNo)}&$select=No,Name,E_Mail`));
+    for (const c of res.rows || []) {
+      const e = String(c.E_Mail || "").toLowerCase().trim();
+      if (e) emails.add(e);
+      people.push({ no: c.No, name: c.Name, email: e });
+    }
+  }
+  return { custEmail, companyContactNo, emails, people };
+}
+
+// Rule-1 contact tiebreak: when candidates tie on name, use the PO BUYER to pick one.
+// Strongest signal first — exact buyer email, then buyer email DOMAIN (both need real BC
+// contact emails, i.e. production), then the buyer NAME against each candidate's Person
+// contacts (works even in the test instance, where every contact email is scrubbed to one
+// placeholder). Resolves ONLY when exactly ONE candidate matches at the strongest tier
+// that produces any match. Scoped to the (few) tied candidates → a handful of reads.
+async function contactTieBreak(company, order, pool) {
+  const email = String(order?.customer?.contact_email || "").toLowerCase().trim();
+  const domain = emailDomain(email);
+  const name = normName(order?.customer?.contact_name || "");
+  if (!email && !name) return null;
+  const enriched = [];
+  for (const c of pool) enriched.push({ c, ...(await contactsForCustomer(company, c.number)) });
+  // Tier 1 — exact buyer email on file for exactly one candidate.
+  if (email) {
+    const hit = enriched.filter((e) => e.emails.has(email));
+    if (hit.length === 1) return { match: hit[0].c, via: "buyer email" };
+  }
+  // Tier 2 — buyer email DOMAIN matches exactly one candidate (skip our own + free providers).
+  if (domain && !NONSPECIFIC_DOMAINS.has(domain)) {
+    const hit = enriched.filter((e) => [...e.emails].some((x) => emailDomain(x) === domain));
+    if (hit.length === 1) return { match: hit[0].c, via: "buyer email domain" };
+  }
+  // Tier 3 — buyer NAME matches a Person contact under exactly one candidate (test-safe).
+  if (name) {
+    const hit = enriched.filter((e) => e.people.some((p) => normName(p.name) === name));
+    if (hit.length === 1) return { match: hit[0].c, via: "buyer contact name" };
+  }
+  return null;
 }
 
 // Fetch one item record by our item number (for inventory/UoM after resolution).
@@ -497,7 +568,10 @@ async function locationAvailability(company, itemNo) {
 const STOCK_LOCATIONS = (process.env.STOCK_LOCATIONS || "CL,CH,AT").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 
 // Rule 2 + 3 — per line: resolve item (direct, then cross-ref), then availability.
-async function checkLine(company, line, custNo, notes, custLoc) {
+// forceLocation (rep-picked ship-from branch) overrides the customer's default location
+// for the stock GATE — a line short at the customer's branch can become creatable when
+// another branch that the rep selected has stock.
+async function checkLine(company, line, custNo, notes, custLoc, forceLocation) {
   const supplier = (line.supplier_part || "").trim();
   const customer = (line.customer_part || "").trim();
   const qty = line.quantity;
@@ -579,7 +653,9 @@ async function checkLine(company, line, custNo, notes, custLoc) {
   const byLoc = la.byLoc;
   const totals = Object.values(byLoc).reduce((a, v) => ({ onHand: a.onHand + v.onHand, onSO: a.onSO + v.onSO }), { onHand: 0, onSO: 0 });
   const fallbackAvail = la.ok ? totals.onHand - totals.onSO : (Number(item.inventory ?? 0)); // if ILE read failed
-  const gateLoc = custLoc && byLoc !== null ? custLoc : null;
+  // Stock gate location: a rep-picked ship-from branch (forceLocation) wins over the
+  // customer's default location; either only applies when per-location data loaded.
+  const gateLoc = byLoc !== null ? (forceLocation || custLoc || null) : null;
   const at = gateLoc ? (byLoc[gateLoc] || { onHand: 0, onSO: 0, avail: 0 }) : null;
   const onHand = at ? at.onHand : totals.onHand;
   const onOrder = at ? at.onSO : totals.onSO;
@@ -659,26 +735,9 @@ async function checkContact(company, order, custNo) {
   const email = String(order?.customer?.contact_email || "").toLowerCase().trim();
   const wantName = normName(order?.customer?.contact_name || "");
   if (!email && !wantName) return { pass: false, detail: "no contact email/name on the PO to match" };
-  const ODC = `${ODBASE}/Company(${odataStr(company.name)})`;
-
-  // the customer's company contact
-  const rel = await get(encodeURI(`${ODC}/ContactBusinessRelation?$filter=No eq ${odataStr(custNo)}&$select=Contact_No,Link_to_Table`));
-  const companyContactNo = (rel.json?.value || []).find((x) => /customer/i.test(x.Link_to_Table || ""))?.Contact_No;
 
   // customer's own email + every Person contact under the company contact
-  const emails = new Set();
-  const people = [];
-  const cr = await get(`companies(${company.id})/customers?$filter=number eq ${odataStr(custNo)}&$select=email`);
-  const custEmail = String(cr.json?.value?.[0]?.email || "").toLowerCase().trim();
-  if (custEmail) emails.add(custEmail);
-  if (companyContactNo) {
-    const res = await getAll(encodeURI(`${ODC}/Contact?$filter=Company_No eq ${odataStr(companyContactNo)}&$select=No,Name,E_Mail`));
-    for (const c of res.rows || []) {
-      const e = String(c.E_Mail || "").toLowerCase().trim();
-      if (e) emails.add(e);
-      people.push({ no: c.No, name: c.Name, email: e });
-    }
-  }
+  const { emails, people } = await contactsForCustomer(company, custNo);
 
   // match: email against a person, else customer-level email, else name against a person
   let matched = email ? people.find((p) => p.email === email) : null;
@@ -813,6 +872,7 @@ async function checkPrices(company, order, lines, quoteNos) {
     if (!Number.isFinite(poPrice)) { l.priceNote = `PO line has no price (quote ${q.unitPrice})`; continue; }
     compared++;
     l.quotePriced = true; // a referenced quote governs this line's price → Rule 8 defers to it
+    l.quotePrice = q.unitPrice; // OUR price for the directional price rule (Rule 6 source, wins over Rule 8)
     const src = `BC/Q ${q.quote}${q.via && q.via.startsWith("order") ? ` → ${q.via}` : ""}`;
     if (Math.abs(poPrice - q.unitPrice) > PRICE_TOL) {
       l.priceFlag = true;
@@ -907,6 +967,7 @@ async function checkBcPrices(company, order, lines, custNo) {
     const poPrice = Number(li.unit_price);
     const bc = await bcPriceFor(company, custNo, l.item, li.quantity, li.uom, order.order_date);
     if (!bc) { l.bcPriceNote = "no BC price-list price on file for this item/qty"; continue; }
+    l.bcListPrice = bc.unitPrice; // OUR price for the directional price rule (Rule 8 source)
     const disc = bc.discountPct ? ` (also ${bc.discountPct}% line disc — not applied)` : "";
     const tag = `BC ${bc.source} price ${uprice(bc.unitPrice)}/ea @ ${Number(bc.minQ).toLocaleString("en-US")}+`;
     if (!Number.isFinite(poPrice) || poPrice <= 0) { l.bcPriceNote = `${tag}${disc} — PO has no price`; continue; }
@@ -941,14 +1002,15 @@ export async function verifyOrder(order, opts = {}) {
   const custLoc = custNo ? (await customerPricing(company, custNo)).location || null : null; // ship-from location
   const lines = [];
   const orderNotes = order.notes ?? order.special_instructions ?? "";
-  for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo, orderNotes, custLoc));
+  for (const li of order.line_items || []) lines.push(await checkLine(company, li, custNo, orderNotes, custLoc, opts.forceLocation));
 
-  // Rule 6 — price match against the referenced BC quote (exact by default). Sets
-  // per-line priceFlag/priceNote; a mismatch gates to review below.
+  // Rule 6 — our price from the referenced BC quote (exact by default). Sets per-line
+  // priceNote + l.quotePrice (OUR price); the DIRECTIONAL rule below decides routing.
   const priceRes = await checkPrices(company, order, lines, (order.quote_refs || []).filter(Boolean));
 
-  // Rule 8 — PO price vs BC price list (customer-specific + qty breaks). Skips lines a
-  // referenced quote already priced. Sets per-line bcPriceFlag/bcPriceNote; mismatch gates.
+  // Rule 8 — our price from the BC price list (customer-specific + qty breaks). Skips lines
+  // a referenced quote already priced. Sets per-line bcPriceNote + l.bcListPrice (OUR price);
+  // the DIRECTIONAL rule below decides routing (higher → quote, lower → notify, unknown → review).
   const bcPriceRes = r1.pass ? await checkBcPrices(company, order, lines, custNo) : { checked: false };
 
   // Payment gate — resolved customer on prepay terms / term+fee payment method → review.
@@ -978,8 +1040,41 @@ export async function verifyOrder(order, opts = {}) {
   const uomIssue = lines.some((l) => l.uomFlag); // non-piece unit -> qty not safe to auto-create
   const qtyIssue = lines.some((l) => l.qtyFlag); // piece qty not a multiple of QTY_STEP (e.g. 2120)
   const platingIssue = lines.some((l) => l.platingFlag); // plating requested but not resolved to one variant
-  const priceIssue = priceRes.checked && priceRes.mismatches > 0; // PO price != referenced quote
-  const bcPriceIssue = bcPriceRes.checked && bcPriceRes.mismatches > 0; // PO price != BC price list
+  // DIRECTIONAL PRICE RULE (per creatable line): our price (referenced quote wins, else BC
+  // price list) vs the customer's PO price.
+  //   our > PO  → the customer must accept the higher price → the whole doc becomes a QUOTE
+  //              (overrides stock; not a review).
+  //   our < PO  → we honor our lower price and process normally, and NOTIFY the customer
+  //              (via the acknowledgement email) that we billed our lower price.
+  //   our ≈ PO  → match (within PRICE_TOL); nothing to do.
+  //   PO priced but our price UNKNOWN (item on no price list and no referenced quote) →
+  //              can't apply the rule → REVIEW.
+  // The created line is always priced by BC from our price list, so "process at our price"
+  // needs no price written — the notification is the only extra step.
+  let priceForcesQuote = false;
+  const underPricedLines = []; // we're cheaper → customer gets a courtesy notification
+  const priceUnknownLines = []; // PO has a price but we can't determine ours → review
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.rule2 || l.blockedFlag) continue; // only lines that will be created
+    const poPrice = Number(order.line_items?.[i]?.unit_price);
+    if (!Number.isFinite(poPrice) || poPrice <= 0) { l.priceDirective = "no-po-price"; continue; } // nothing to compare
+    const our = l.quotePriced ? l.quotePrice : (Number.isFinite(l.bcListPrice) ? l.bcListPrice : null);
+    if (our == null) { l.priceDirective = "unknown"; priceUnknownLines.push(l); continue; }
+    l.ourPrice = our;
+    const src = l.quotePriced ? "quote" : "price list";
+    if (our - poPrice > PRICE_TOL) {
+      l.priceDirective = "higher"; priceForcesQuote = true;
+      l.priceDirNote = `our ${uprice(our)} (${src}) > PO ${uprice(poPrice)} → quote for customer acceptance`;
+    } else if (poPrice - our > PRICE_TOL) {
+      l.priceDirective = "lower";
+      l.priceDirNote = `our ${uprice(our)} (${src}) < PO ${uprice(poPrice)} → process at our price; notify customer`;
+      underPricedLines.push({ label: l.label, item: l.item, ourPrice: our, poPrice });
+    } else {
+      l.priceDirective = "match";
+    }
+  }
+  const priceUnknownIssue = priceUnknownLines.length > 0;
   // Blocked items are EXCLUDED from the created doc, so the order/quote decision (and
   // stock check) considers only the NON-blocked lines. If EVERY line is blocked there is
   // nothing left to create -> hard review.
@@ -1028,12 +1123,9 @@ export async function verifyOrder(order, opts = {}) {
     disposition = "review";
     const p = lines.find((l) => l.platingFlag);
     dispositionReason = `plating/finish needs a pick — ${p?.platingNote || "couldn't resolve the requested finish to one BC item"}`;
-  } else if (priceIssue) {
+  } else if (priceUnknownIssue) {
     disposition = "review";
-    dispositionReason = `${priceRes.mismatches} line(s) priced differently from the referenced quote (BC/Q ${priceRes.quotes.join(", ")}) — confirm the price before creating`;
-  } else if (bcPriceIssue) {
-    disposition = "review";
-    dispositionReason = `${bcPriceRes.mismatches} line(s) priced differently from the BC price list (customer/qty-break price) — confirm the price before creating`;
+    dispositionReason = `${priceUnknownLines.length} line(s) have a PO price but no price we can determine (not on any price list, no referenced quote) — a human must set the price before creating`;
   } else if (allBlocked) {
     disposition = "review";
     dispositionReason = `all ${lines.length} line(s) are blocked in BC — nothing left to create`;
@@ -1060,8 +1152,16 @@ export async function verifyOrder(order, opts = {}) {
       disposition = "review"; dispositionReason = `ship-to not on file — ${shipToRes.detail}`;
     } else if (CONTACT_GATE && !contactRes.pass) {
       disposition = "review"; dispositionReason = `contact/email not on file — ${contactRes.detail}`;
-    } else if (allInStock) {
+    } else if (allInStock && !priceForcesQuote) {
       disposition = "order"; dispositionReason = `customer & ship-to matched; all lines in stock${contactNote}`;
+    } else if (priceForcesQuote) {
+      // Our price is higher than the PO on ≥1 line → the customer must accept it → Quote,
+      // regardless of stock. (A short line would land here too; the reason favors stock.)
+      const n = lines.filter((l) => l.priceDirective === "higher").length;
+      dispositionReason = allInStock
+        ? `customer & ship-to matched; our price is higher than the PO on ${n} line(s) → quote for customer acceptance${contactNote}`
+        : `customer & ship-to matched; one or more lines short, and our price higher than the PO on ${n} line(s) → quote${contactNote}`;
+      disposition = "quote";
     } else {
       disposition = "quote"; dispositionReason = `customer & ship-to matched; one or more lines short → quote${contactNote}`;
     }
@@ -1073,9 +1173,10 @@ export async function verifyOrder(order, opts = {}) {
     const holds = [];
     if (requiresApproval) holds.push(`⚠ ${approvalReason}`);
     if (blockedLines.length) holds.push(`⚠ ${blockedLines.length} line(s) blocked in BC (${blockedLines.map((b) => b.item).slice(0, 3).join(", ")}) — excluded from the created doc`);
+    if (underPricedLines.length) holds.push(`ℹ ${underPricedLines.length} line(s) below the PO price — we bill our lower price; customer will be notified`);
     if (holds.length) dispositionReason = `${dispositionReason} · ${holds.join(" · ")}`;
   }
-  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines, paymentReview: pay, serviceReview, customerBlocked, bcPrice: bcPriceRes };
+  return { company: company.name, rule1: r1, lines, linesPass: allInStock, gateCustomer, gateParts, disposition, dispositionReason, shipTo: shipToRes, contact: contactRes, price: priceRes, orderTotal: priced ? poTotal : null, threshold: REVIEW_OVER, highValue, noPrice, requiresApproval, approvalReason, blockedLines, paymentReview: pay, serviceReview, customerBlocked, bcPrice: bcPriceRes, priceForcesQuote, underPriced: underPricedLines, priceUnknown: priceUnknownLines.map((l) => ({ label: l.label, item: l.item })) };
 }
 
 const DISPO = { order: "🟢 CREATE AS ORDER", quote: "📄 CREATE AS QUOTE", review: "⛔ NEEDS REVIEW" };

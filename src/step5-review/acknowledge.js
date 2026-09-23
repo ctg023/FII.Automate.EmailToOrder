@@ -56,18 +56,33 @@ export function buildAck(record, created) {
   const shipLine = shipDate ? ` Your requested ship date of <b>${esc(shipDate)}</b> is noted.` : "";
   const shipLineTxt = shipDate ? ` Your requested ship date of ${shipDate} is noted.` : "";
 
+  // Lower-price courtesy notice: when our price is below what the PO stated, we honor our
+  // lower price and tell the customer (per the pricing rule). Fasteners quote per-piece.
+  const uprice = (v) => `$${Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 5 })}`;
+  const under = (created?.underPriced || []).filter((u) => Number.isFinite(u.ourPrice) && Number.isFinite(u.poPrice));
+  const underHtml = under.length
+    ? `<p>Please note: on the following item${under.length > 1 ? "s" : ""} our current price is <b>lower</b> than the price on your PO, and we have entered the order at our lower price:</p>
+  <ul>${under.map((u) => `<li>${esc(u.label || u.item)}: our price <b>${uprice(u.ourPrice)}</b>/ea (your PO: ${uprice(u.poPrice)}/ea)</li>`).join("")}</ul>`
+    : "";
+  const underTxt = under.length
+    ? `\nPlease note: on the following item${under.length > 1 ? "s" : ""} our current price is lower than the price on your PO, and we entered the order at our lower price:\n`
+      + under.map((u) => `  - ${u.label || u.item}: our price ${uprice(u.ourPrice)}/ea (your PO: ${uprice(u.poPrice)}/ea)`).join("\n") + "\n"
+    : "";
+
   // Brief acknowledgement of receipt (no line-item table). Pricing/ship-date confirmation
   // is handled as a follow-up, so this note doesn't commit to either.
   const html = `<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#1c2230">
   <p>Hello${contactName ? ` ${esc(contactName)}` : ""},</p>
   <p>Thank you — we have received your purchase order <b>${esc(po)}</b>${cust ? ` from ${esc(cust)}` : ""} and entered it as ${docLabel}${bcNo ? ` <b>${esc(bcNo)}</b>` : ""}.${shipLine} We will follow up shortly to confirm pricing and the ship date.</p>
+  ${underHtml}
   <p>Please reply to this email with any questions.</p>
   <p>Regards,<br>${esc(ACK_FROM_NAME)}</p>
 </div>`;
 
   const text = `Hello${contactName ? ` ${contactName}` : ""},\n\n`
-    + `Thank you - we have received your purchase order ${po}${cust ? ` from ${cust}` : ""} and entered it as ${docLabel}${bcNo ? ` ${bcNo}` : ""}.${shipLineTxt} We will follow up shortly to confirm pricing and the ship date.\n\n`
-    + `Please reply with any questions.\n\nRegards,\n${ACK_FROM_NAME}\n`;
+    + `Thank you - we have received your purchase order ${po}${cust ? ` from ${cust}` : ""} and entered it as ${docLabel}${bcNo ? ` ${bcNo}` : ""}.${shipLineTxt} We will follow up shortly to confirm pricing and the ship date.\n`
+    + underTxt
+    + `\nPlease reply with any questions.\n\nRegards,\n${ACK_FROM_NAME}\n`;
 
   return { to, subject, html, text, meta: { bcNo, docLabel, po } };
 }

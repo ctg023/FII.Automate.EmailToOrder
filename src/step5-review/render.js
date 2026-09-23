@@ -27,6 +27,18 @@ import { pathToFileURL } from "node:url";
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const n = (x) => (x == null ? "" : Number(x).toLocaleString("en-US"));
+// Corporate "external email" warning banners get prepended to inbound bodies and bury the
+// real message in the preview. Strip the common ones so the snippet shows actual content.
+// Display-only — the full body is untouched in the stored record.
+function stripEmailBanners(s) {
+  return String(s || "")
+    .replace(/CAUTION:\s*This email originated from outside[\s\S]*?other than email\.?/gi, " ")
+    .replace(/\[?\bEXTERNAL(?:\s+EMAIL)?\b\]?:?/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+// Ship-from branches a rep may re-point an order to (same list as the stock cells).
+const STOCK_LOCATIONS = (process.env.STOCK_LOCATIONS || "CL,CH,AT").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 const usd = (x) => (Number.isFinite(Number(x)) ? `$${Number(x).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—");
 const uprice = (x) => (Number.isFinite(Number(x)) ? `$${Number(x).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 5 })}` : "—"); // keep fastener precision
 
@@ -77,12 +89,27 @@ function suggestionBtn(s) {
 // One line-item check row. Green ✓ only when the line is genuinely ready: resolved,
 // in stock, AND no blocking quantity/UoM problem. A resolved+in-stock line whose
 // quantity isn't safe to create (not a multiple of 100, or a multiplier UoM) shows ✕.
-function lineRow(l, poLine) {
-  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !l.priceFlag && !l.platingFlag && !l.blockedFlag && !l.bcPriceFlag;
-  const state = ok ? "ok" : "bad";
-  const mark = ok ? "✓" : l.rule2 ? "✕" : "!";
-  const priceNote = l.priceNote ? `<div class="sub">${l.priceFlag ? "⚠ " : ""}${esc(l.priceNote)}</div>` : "";
-  const bcPriceNote = l.bcPriceNote ? `<div class="sub">${l.bcPriceFlag ? "⚠ " : ""}${esc(l.bcPriceNote)}</div>` : "";
+function lineRow(l, poLine, idx) {
+  // Directional price rule outcome (per line). "unknown" = a PO price with no price we can
+  // determine → review (a line problem). "higher"/"lower"/"match" are NOT line failures:
+  // higher routes the whole doc to a quote, lower bills our price + notifies the customer.
+  const priceUnknown = l.priceDirective === "unknown";
+  // A "higher" line is in stock but its price is above the PO → it forces the whole doc to
+  // a Quote. Mark it distinctly (blue 📄) so it doesn't read as a clean ✓ that "should be an
+  // order" — the reason the doc isn't an order lives on this line.
+  const forcesQuote = l.priceDirective === "higher";
+  const ok = l.pass && !l.qtyFlag && !l.uomFlag && !priceUnknown && !forcesQuote && !l.platingFlag && !l.blockedFlag;
+  const state = ok ? "ok" : forcesQuote ? "quote" : "bad";
+  const mark = ok ? "✓" : forcesQuote ? "📄" : l.rule2 ? "✕" : "!";
+  // Keep BOTH prices visible (PO price shown separately below; these are the "our price"
+  // comparison notes from Rules 6/8). No manual control — the direction drives routing.
+  const priceNote = l.priceNote ? `<div class="sub">${esc(l.priceNote)}</div>` : "";
+  const bcPriceNote = l.bcPriceNote ? `<div class="sub">${esc(l.bcPriceNote)}</div>` : "";
+  const dirIcon = { higher: "→ 📄", lower: "✓ ↓", unknown: "⚠", match: "✓" }[l.priceDirective] || "";
+  const dirClass = l.priceDirective === "higher" ? "dir-higher" : l.priceDirective === "lower" ? "dir-lower" : l.priceDirective === "unknown" ? "dir-unknown" : "";
+  const priceDir = l.priceDirNote
+    ? `<div class="sub ${dirClass}">${dirIcon} ${esc(l.priceDirNote)}</div>`
+    : (priceUnknown ? `<div class="sub dir-unknown">⚠ PO has a price but we can't determine our price — needs a human to set it</div>` : "");
   const blockedNote = l.blockedFlag ? `<div class="sub" style="color:var(--bad);font-weight:600">⛔ Item ${esc(l.item || "")} is BLOCKED in BC — this line is excluded from the created doc.</div>` : "";
   // Per-location available stock (customer's ship-from location bold/starred = the one the gate uses).
   const locLine = (l.locStock && l.locStock.length)
@@ -107,8 +134,27 @@ function lineRow(l, poLine) {
         ${priceLine}
         ${priceNote}
         ${bcPriceNote}
+        ${priceDir}
         ${blockedNote}
       </div></div>`;
+}
+
+// Whole-PO ship-from picker. The stock gate uses one branch for the order; a rep can
+// re-point it to any STOCK_LOCATIONS branch (e.g. the one that actually has stock), which
+// can flip a short Quote to an Order. "Reset" returns to the customer's default location.
+function shipFromBlock(r) {
+  if (!r.rule1?.pass) return ""; // need a resolved customer for stock context
+  const lines = r.lines || [];
+  if (!lines.some((l) => l.locStock && l.locStock.length)) return ""; // no per-location data loaded
+  const forced = r.location_assigned?.code || null;
+  const cur = forced || lines.map((l) => l.gateLoc).find(Boolean) || null;
+  const opts = STOCK_LOCATIONS
+    .map((L) => `<button class="sugg loc" data-act="assign-location" data-code="${esc(L)}"${L === cur ? ' aria-current="true"' : ""}><b>${esc(L)}</b>${L === cur ? " — current" : ""}</button>`)
+    .join("");
+  const reset = forced ? `<button class="sugg loc" data-act="assign-location" data-code=""><b>Reset</b> — customer default</button>` : "";
+  const label = cur ? `<b>${esc(cur)}</b> ${forced ? "(rep-selected)" : "(customer default)"}` : "—";
+  return `<div class="shipfrom"><span class="k">Ship from:</span> ${label} <button class="changelink" data-act="change-location">change</button>
+      <div class="locfix" hidden><div class="suggs">${opts}${reset}</div></div></div>`;
 }
 
 // Order details: dates (order date, requested/ship) and any special instructions
@@ -131,11 +177,12 @@ function conversationBlock(r) {
   if (!r.conversation?.length) return "";
   const rows = r.conversation.map((m) => {
     const who = m.direction === "outbound" ? "Buckeye →" : "→ customer";
-    const body = esc((m.body_text || "").replace(/\s+/g, " ").slice(0, 600));
+    const clean = stripEmailBanners(m.body_text);
+    const body = esc(clean.slice(0, 600));
     return `<div class="msg ${m.direction === "outbound" ? "out" : "in"}">
         <div class="msg-h"><b>${esc(m.from || "")}</b> <span class="msg-dir">${who}</span>
           <span class="msg-when">${esc((m.received || "").slice(0, 16).replace("T", " "))}</span></div>
-        <div class="msg-b">${body}${(m.body_text || "").length > 600 ? "…" : ""}</div>
+        <div class="msg-b">${body}${clean.length > 600 ? "…" : ""}</div>
       </div>`;
   }).join("");
   return `<div class="sec">Conversation (${r.conversation.length} message${r.conversation.length > 1 ? "s" : ""})</div>
@@ -236,7 +283,9 @@ function cardFacets(r) {
   if (r.contact && !r.contact.pass) f.add("contact");
   if (!(r.line_items || []).length) f.add("item");
   if ((r.lines || []).some((l) => !l.rule2 || l.blockedFlag || l.uomFlag || l.qtyFlag || l.platingFlag)) f.add("item");
-  if ((r.lines || []).some((l) => l.priceFlag || l.bcPriceFlag)) f.add("price");
+  // Price facet: any line where our price differs from the PO (higher → quote, lower →
+  // notify) or where we couldn't determine our price (→ review).
+  if ((r.lines || []).some((l) => ["higher", "lower", "unknown"].includes(l.priceDirective))) f.add("price");
   if (r.paymentReview?.review) f.add("payment");
   if (r.customerBlocked) f.add("blocked");
   if (r.requiresApproval) f.add("highvalue");
@@ -281,7 +330,7 @@ export function card(r) {
     : "";
 
   const lineRows = lineCount
-    ? (r.lines || []).map((l, i) => lineRow(l, r.line_items?.[i])).join("")
+    ? (r.lines || []).map((l, i) => lineRow(l, r.line_items?.[i], i)).join("")
     : `<div class="check"><span class="dot bad">!</span><div class="txt"><span class="k">No line items extracted</span><div class="sub">Order body/attachment produced no lines — needs a rep.</div></div></div>`;
 
   const urgent = urgencyOf(r);
@@ -317,6 +366,7 @@ export function card(r) {
       ${customerFix}
       ${shipContactBlock(r)}
       <div class="sec">Line items — part match, stock &amp; PO price</div>
+      ${shipFromBlock(r)}
       ${lineRows}
       ${Number.isFinite(Number(r.orderTotal)) ? `<div class="pototal">PO total (from line prices): <b>${usd(r.orderTotal)}</b></div>` : ""}
       <div class="actions">
@@ -410,6 +460,14 @@ export function page(data, opts = {}) {
   .csi:focus{outline:none;border-color:var(--accent)}
   .csresults{margin-top:6px}.csresults:empty{margin:0}
   .changelink{border:none;background:none;color:var(--accent);cursor:pointer;font:inherit;font-size:12px;padding:0 0 0 6px;text-decoration:underline}
+  .shipfrom{font-size:12.5px;margin:0 0 8px;color:var(--muted)}
+  .shipfrom .k{color:var(--ink);font-weight:600}
+  .shipfrom .sugg.loc{flex-direction:row;gap:6px}
+  .shipfrom .sugg.loc[aria-current="true"]{border-color:var(--accent);font-weight:600}
+  .locfix{margin-top:6px}
+  .dir-lower{color:var(--ok);font-weight:600}
+  .dir-higher{color:var(--quote);font-weight:600}
+  .dir-unknown{color:var(--bad);font-weight:600}
   .main{flex:1;min-width:0}.po{font-weight:650}
   .cust{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .meta{color:var(--muted);font-size:12px;text-align:right;white-space:nowrap}
@@ -417,7 +475,7 @@ export function page(data, opts = {}) {
   .detail{border-top:1px solid var(--line);padding:14px 15px}
   .check{display:flex;gap:9px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:13.5px}.check:last-of-type{border-bottom:0}
   .dot{margin-top:2px;flex:none;width:16px;height:16px;border-radius:50%;font-size:11px;line-height:16px;text-align:center;color:#fff}
-  .dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}
+  .dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.quote{background:var(--quote)}
   .txt{flex:1}.txt .k{font-weight:600}.sub{color:var(--muted);font-size:12.5px}.part{font-variant-numeric:tabular-nums}
   .sec{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:12px 0 4px}
   .actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
@@ -526,6 +584,19 @@ document.addEventListener('click', async (e)=>{
     return;
   }
 
+  const changeLoc = e.target.closest('[data-act="change-location"]');
+  if(changeLoc){
+    const box = changeLoc.closest('.shipfrom').querySelector('.locfix'); if(box) box.hidden=!box.hidden; return;
+  }
+  const assignLoc = e.target.closest('[data-act="assign-location"]');
+  if(assignLoc){
+    const card = assignLoc.closest('details[data-cid]'); const res = card.querySelector('.result');
+    res.hidden=false; res.textContent='Setting ship-from location and re-checking stock…';
+    const out = await post('/api/assign-location',{conversationId:card.dataset.cid, code:assignLoc.dataset.code});
+    if(out.ok){ res.textContent='Ship-from set → '+out.disposition+'. Reloading…'; setTimeout(()=>location.reload(),700); }
+    else res.textContent='Location assign failed: '+(out.reason||'unknown');
+    return;
+  }
   if(assign){
     const card = assign.closest('details[data-cid]'); const res = card.querySelector('.result');
     res.hidden=false; res.textContent='Assigning '+assign.dataset.name+' and re-checking against BC…';
@@ -612,6 +683,14 @@ function applyFilter(key){
 }
 document.addEventListener('click',(e)=>{ const f=e.target.closest('[data-filter]'); if(f) applyFilter(f.dataset.filter); });
 try{ const saved=localStorage.getItem('queueFilter'); if(saved && saved!=='all' && document.querySelector('[data-filter="'+saved+'"]')) applyFilter(saved); }catch(e){}
+// Keep the open card(s) open across the reload that follows an action (assign customer /
+// ship-to / ship-from), so the rep SEES the updated disposition instead of a collapsed card.
+function saveOpenCards(){ try{ sessionStorage.setItem('openCards', JSON.stringify([...document.querySelectorAll('details.card[open]')].map(d=>d.dataset.cid))); }catch(e){} }
+document.addEventListener('toggle',(e)=>{ if(e.target.matches && e.target.matches('details.card')) saveOpenCards(); }, true);
+try{ const open=JSON.parse(sessionStorage.getItem('openCards')||'[]'); let first=null;
+  for(const cid of open){ const d=document.querySelector('details.card[data-cid="'+(window.CSS&&CSS.escape?CSS.escape(cid):cid)+'"]'); if(d){ d.open=true; if(!first) first=d; } }
+  if(first) first.scrollIntoView({block:'center'});
+}catch(e){}
 </script>`;
 
 function main() {

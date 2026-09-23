@@ -81,13 +81,17 @@ function savePdfs(conversationId, pdfs) {
   return saved;
 }
 
-// For an order/quote record: has this PO already been entered in BC (dup guard),
-// and save its source PDFs. Read-only against BC. Mutates the record in place.
-async function enrichRecord(record, pdfs) {
-  try {
-    const company = await getCompany();
-    record.duplicates = await findDuplicates(company, record.rule1?.match?.number, record.po_number);
-  } catch { record.duplicates = []; }
+// Save a record's source PDFs (so ANY card — order, quote, or review — can link the PO)
+// and, for creatable records, check whether the PO is already in BC (dup guard). The
+// dup-check needs a matched customer, so it's skipped for records without one. Read-only
+// against BC. Mutates the record in place.
+async function enrichRecord(record, pdfs, { dupCheck = true } = {}) {
+  if (dupCheck && (record.rule1?.match?.number || record.customer_assigned?.number)) {
+    try {
+      const company = await getCompany();
+      record.duplicates = await findDuplicates(company, record.rule1?.match?.number || record.customer_assigned?.number, record.po_number);
+    } catch { record.duplicates = []; }
+  }
   record.attachments_saved = savePdfs(record.conversationId, pdfs);
 }
 
@@ -333,7 +337,9 @@ async function cmdRun(limit) {
     catch (e) { console.log(`  ! ${t.subject?.slice(0, 40)} — verify failed: ${e.message}`); continue; }
     const record = toRecord(t, order, res, classification);
     if (assigned) record.customer_assigned = { number: assigned.number, name: assigned.name };
-    if (res.disposition === "order" || res.disposition === "quote") await enrichRecord(record, pdfs);
+    // Save source PDFs for EVERY card (a reviewer needs the PO too); the BC duplicate
+    // check only applies to creatable (order/quote) records.
+    await enrichRecord(record, pdfs, { dupCheck: res.disposition === "order" || res.disposition === "quote" });
     store.threads[t.conversationId] = { message_ids: t.message_ids, classification, disposition: res.disposition, record };
     const dupNote = record.duplicates?.length ? " ⚠dup-in-BC" : "";
     console.log(`  ✓ ${res.disposition.padEnd(6)} ${t.subject?.slice(0, 50)}  (${label})${dupNote}`);
@@ -355,15 +361,15 @@ async function cmdEnrich() {
   const byConv = Object.fromEntries(threads.map((t) => [t.conversationId, t]));
   let n = 0;
   for (const [cid, entry] of Object.entries(store.threads)) {
-    if (!entry.record || (entry.disposition !== "order" && entry.disposition !== "quote")) continue;
+    if (!entry.record) continue; // every real card (order / quote / review) — not the hidden not_order stubs
     const pdfs = byConv[cid] ? await hydratePdfs(byConv[cid]) : [];
-    await enrichRecord(entry.record, pdfs);
+    await enrichRecord(entry.record, pdfs, { dupCheck: entry.disposition === "order" || entry.disposition === "quote" });
     n++;
     if (entry.record.duplicates?.length) console.log(`  ⚠ dup-in-BC  PO ${entry.record.po_number}  ${entry.record.customer?.name || ""}`);
   }
   store.generated = new Date().toISOString();
   saveStore(store);
-  console.log(`  Enriched ${n} order/quote record(s) with BC duplicate check + saved PDFs.`);
+  console.log(`  Enriched ${n} record(s) with saved PDFs (BC duplicate check on order/quote).`);
   renderFromStore(store);
 }
 

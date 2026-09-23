@@ -140,8 +140,26 @@ async function setShipToCode(company, docType, number, code) {
   return { ok: r.ok, status: r.status, text: (await r.text().catch(() => "")).slice(0, 200) };
 }
 
-export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false, forceCustomer = null, forceShipTo = null, approval = null } = {}) {
-  const res = await verifyOrder(order, { ...(forceCustomer ? { forceCustomer } : {}), ...(forceShipTo ? { forceShipTo } : {}) });
+// Post-header, pre-lines: set the document's Location Code (ship-from branch) on the
+// classic page — the standard API salesOrder header has no locationCode. Set BEFORE the
+// lines are POSTed so BC copies it onto each new line as the default. Best-effort/non-fatal.
+// ⚠ Not yet validated on a real create (same status as the Ship_to_Code PATCH).
+async function setLocationCode(company, docType, number, code) {
+  const ODBASE = BASE.replace(/\/api\/v2\.0$/i, "/ODataV4");
+  const odStr = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  const page = docType === "quote" ? "Sales_Quote_Excel" : "Sales_Order_Excel";
+  const dt = docType === "quote" ? "Quote" : "Order";
+  const url = encodeURI(`${ODBASE}/Company(${odStr(company.name)})/${page}(Document_Type=${odStr(dt)},No=${odStr(number)})`);
+  const r = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: AUTH, "Content-Type": "application/json", "If-Match": "*" },
+    body: JSON.stringify({ Location_Code: code }),
+  });
+  return { ok: r.ok, status: r.status, text: (await r.text().catch(() => "")).slice(0, 200) };
+}
+
+export async function createDoc(order, { doCreate = false, targetCompany = null, allowDuplicate = false, forceCustomer = null, forceShipTo = null, forceLocation = null, approval = null } = {}) {
+  const res = await verifyOrder(order, { ...(forceCustomer ? { forceCustomer } : {}), ...(forceShipTo ? { forceShipTo } : {}), ...(forceLocation ? { forceLocation } : {}) });
   if (res.disposition === "review") {
     return { ok: false, stage: "verify", disposition: res.disposition, dispositionReason: res.dispositionReason };
   }
@@ -176,6 +194,13 @@ export async function createDoc(order, { doCreate = false, targetCompany = null,
   const hdr = await api("POST", `companies(${company.id})/${doc.ent}`, doc.header);
   if (!hdr.ok) return { ok: false, stage: "post-header", reason: `header POST HTTP ${hdr.status}: ${(hdr.text || "").slice(0, 300)}`, ...preview };
   const docId = hdr.json?.id, number = hdr.json?.number;
+  // Set the ship-from Location Code (rep override) BEFORE the lines so BC defaults each new
+  // line to that branch. Best-effort; a failure leaves BC's default location, never fatal.
+  let locationCode = null;
+  if (forceLocation) {
+    try { const pr = await setLocationCode(company, doc.docType, number, forceLocation); locationCode = pr.ok ? forceLocation : `not set (HTTP ${pr.status})`; }
+    catch (e) { locationCode = `not set (${e.message})`; }
+  }
   const lineResults = [];
   for (const line of doc.lines) {
     const lr = await api("POST", `companies(${company.id})/${doc.ent}(${docId})/${doc.lineEnt}`, line);
@@ -189,7 +214,7 @@ export async function createDoc(order, { doCreate = false, targetCompany = null,
     try { const pr = await setShipToCode(company, doc.docType, number, code); shipToCode = pr.ok ? code : `not set (HTTP ${pr.status})`; }
     catch (e) { shipToCode = `not set (${e.message})`; }
   }
-  return { ok: true, created: true, docType: doc.docType, number, id: docId, company: company.name, duplicates, lineResults, approvedBy: signOff, blockedExcluded: res.blockedLines || [], shipToCode };
+  return { ok: true, created: true, docType: doc.docType, number, id: docId, company: company.name, duplicates, lineResults, approvedBy: signOff, blockedExcluded: res.blockedLines || [], shipToCode, locationCode, underPriced: res.underPriced || [] };
 }
 
 async function run({ orderPath, doCreate, targetCompany, allowDuplicate, approver }) {

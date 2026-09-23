@@ -28,6 +28,8 @@ const PORT = Number(process.env.REVIEW_PORT || 8787);
 const STORE = process.env.REVIEW_STORE || "out/review-store.json";
 const PDF_ROOT = resolve("out/pdfs");
 const TARGET_COMPANY = process.env.BC_COMPANY || null; // the sandbox company to write to
+// Ship-from branches a rep may re-point an order to (same list the stock cells use).
+const STOCK_LOCATIONS = (process.env.STOCK_LOCATIONS || "CL,CH,AT").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 const BC_WEB_URL = process.env.BC_WEB_URL || null;     // BC web client base (browser URL), for deep links
 
 // Deep link to open a created doc in the BC web client. Sales Quote = page 41,
@@ -55,6 +57,15 @@ const orderFromRecord = (rec) => ({
   special_instructions: rec.special_instructions,
   service_action_required: rec.service_action_required, service_action_reason: rec.service_action_reason,
   quote_refs: rec.quote_refs?.length ? rec.quote_refs : [...new Set((rec.conversation || []).flatMap((m) => bcqNumbers(m.subject || "")))],
+});
+
+// All active rep overrides for a record, so every re-verify / preview / create carries
+// the full set (customer, ship-to, ship-from location, price-reviewed lines) — not just
+// the one being changed. Mirrors the verifyOrder / createDoc opts shape.
+const optsFromRecord = (r) => ({
+  ...(r.customer_assigned ? { forceCustomer: { number: r.customer_assigned.number, displayName: r.customer_assigned.name } } : {}),
+  ...(r.shipto_assigned?.code ? { forceShipTo: r.shipto_assigned.code } : {}),
+  ...(r.location_assigned?.code ? { forceLocation: r.location_assigned.code } : {}),
 });
 
 // Open queue = cached order/quote/review records not yet actioned.
@@ -158,7 +169,9 @@ async function handle(req, res) {
       r.requiresApproval = res2.requiresApproval; r.approvalReason = res2.approvalReason;
       r.orderTotal = res2.orderTotal; r.threshold = res2.threshold; r.blockedLines = res2.blockedLines;
       r.customer_assigned = { number: customerNumber, name: customerName };
-      delete r.shipto_assigned; // a prior ship-to pick belongs to the old customer
+      // A prior ship-to / ship-from pick belongs to the old customer.
+      delete r.shipto_assigned;
+      delete r.location_assigned;
       saveStore(store);
       // Learn from the pick: future emails from this customer (domain/name) auto-resolve.
       setAlias({ email: r.customer?.contact_email, name: r.customer?.name, number: customerNumber, customerName });
@@ -197,12 +210,32 @@ async function handle(req, res) {
     const entry = store.threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
     const r = entry.record;
-    const fc = r.customer_assigned ? { number: r.customer_assigned.number, displayName: r.customer_assigned.name } : null;
     try {
-      const res2 = await verifyOrder(orderFromRecord(r), { ...(fc ? { forceCustomer: fc } : {}), forceShipTo: code });
+      const res2 = await verifyOrder(orderFromRecord(r), { ...optsFromRecord(r), forceShipTo: code });
       r.shipTo = res2.shipTo; r.contact = res2.contact;
       r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
       r.shipto_assigned = { code };
+      saveStore(store);
+      return json(res, 200, { ok: true, disposition: res2.disposition, dispositionReason: res2.dispositionReason });
+    } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
+  }
+
+  // Assign a ship-from location a rep picked (STOCK_LOCATIONS branch), then re-verify. A
+  // line short at the customer's default branch can flip to in-stock (Quote→Order) when the
+  // chosen branch has stock. code = "" clears the override (back to the customer's default).
+  if (req.method === "POST" && p === "/api/assign-location") {
+    const { conversationId, code } = await readBody(req);
+    const store = loadStore();
+    const entry = store.threads[conversationId];
+    if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
+    const loc = (code || "").trim().toUpperCase();
+    if (loc && !STOCK_LOCATIONS.includes(loc)) return json(res, 400, { ok: false, reason: `unknown location "${loc}" (allowed: ${STOCK_LOCATIONS.join(", ")})` });
+    const r = entry.record;
+    if (loc) r.location_assigned = { code: loc }; else delete r.location_assigned;
+    try {
+      const res2 = await verifyOrder(orderFromRecord(r), optsFromRecord(r));
+      r.lines = res2.lines; r.linesPass = res2.linesPass;
+      r.disposition = res2.disposition; r.dispositionReason = res2.dispositionReason; entry.disposition = res2.disposition;
       saveStore(store);
       return json(res, 200, { ok: true, disposition: res2.disposition, dispositionReason: res2.dispositionReason });
     } catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
@@ -212,9 +245,7 @@ async function handle(req, res) {
     const { conversationId } = await readBody(req);
     const entry = loadStore().threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
-    const fc = entry.record.customer_assigned ? { number: entry.record.customer_assigned.number, displayName: entry.record.customer_assigned.name } : null;
-    const fs = entry.record.shipto_assigned?.code || null;
-    try { return json(res, 200, await createDoc(orderFromRecord(entry.record), { doCreate: false, forceCustomer: fc, forceShipTo: fs })); }
+    try { return json(res, 200, await createDoc(orderFromRecord(entry.record), { doCreate: false, ...optsFromRecord(entry.record) })); }
     catch (e) { return json(res, 500, { ok: false, reason: e.message }); }
   }
 
@@ -223,12 +254,10 @@ async function handle(req, res) {
     const store = loadStore();
     const entry = store.threads[conversationId];
     if (!entry?.record) return json(res, 404, { ok: false, reason: "not found" });
-    const fc = entry.record.customer_assigned ? { number: entry.record.customer_assigned.number, displayName: entry.record.customer_assigned.name } : null;
-    const fs = entry.record.shipto_assigned?.code || null;
     try {
       // `approver` = the second, independent sign-off for high-value POs (createDoc
       // refuses a high-value write without it). Ignored for normal-value POs.
-      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate, forceCustomer: fc, forceShipTo: fs, approval: approver });
+      const out = await createDoc(orderFromRecord(entry.record), { doCreate: true, targetCompany: TARGET_COMPANY, allowDuplicate: !!allowDuplicate, approval: approver, ...optsFromRecord(entry.record) });
       if (out.ok && out.created) { // mark actioned so it leaves the open queue
         entry.record.status = "actioned"; entry.record.bc_number = out.number; entry.record.bc_docType = out.docType;
         entry.record.bc_url = bcLink(out.docType, out.number);

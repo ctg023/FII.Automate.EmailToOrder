@@ -21,7 +21,12 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
   **native PDF bytes** as document blocks (`buildMessageContent`), so real/scanned PDFs are read directly.
 - **Step 3 (classification):** done — harness in `src/step3-classification/`; 92%, **0 dropped orders**.
 - **Step 4 (BC verification):** done (read-only) — `src/step4-bc-verification/verify.js` assigns a
-  **disposition** (Order / Quote / Needs-review). Rules: **1** customer name match · **2** line items
+  **disposition** (Order / Quote / Needs-review). Rules: **1** customer name match (whole-token name
+  match; a unique hit resolves. Ties are broken by, in order: ship-to **city/state**, then a **contact
+  tiebreak** — the PO buyer against each tied candidate's BC contacts: exact **email**, then email
+  **domain** (both prod; free-mail/own domains excluded), then buyer **name** (works in the test instance
+  where contact emails are scrubbed). Resolves only when exactly ONE candidate matches; else flags for a
+  human. Learned aliases still consulted first.) · **2** line items
   (direct / cross-ref via `Item_References_Excel`, then two fallbacks for messy part fields —
   **part-field prefix**: real part + crammed description words, e.g. `HS3 M6 PROJECTION WELD NUT`→`HS3 M6`;
   and **description-anchored**: clean part in the description when the part field carries a tag, e.g.
@@ -92,6 +97,22 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     and is kept across re-verifies. On create, a **post-create classic-page PATCH** sets the established
     `Ship_to_Code` on `Sales_Order_Excel`/`Sales_Quote_Excel` (the standard API has no `shipToCode` — address
     fields are written as a safe fallback if the PATCH fails). ⚠️ PATCH not yet validated on a real create.
+  - **Ship-from location picker:** a **change** link on the "Ship from" row (Line items section) lets a rep
+    re-point the whole PO to any `STOCK_LOCATIONS` branch (`/api/assign-location`, `forceLocation`). The stock
+    gate then uses that branch instead of the customer's default `Location_Code`, so a line **short at the
+    customer's branch flips to in-stock (Quote→Order) when the chosen branch has stock**. Kept across
+    re-verifies; **Reset** returns to the customer default. On create, a **post-create classic-page PATCH** sets
+    `Location_Code` on `Sales_Order_Excel`/`Sales_Quote_Excel` **before the lines are POSTed** so BC defaults each
+    line to that branch (same mechanism as `Ship_to_Code`). ⚠️ PATCH not yet validated on a real create.
+  - **Directional price rule (our price vs PO price):** the created line is **always priced from OUR BC price
+    list** (create.js POSTs no price — BC fills it), so a Rule 6/8 comparison drives **routing**, not billing.
+    Per creatable line, compare **our price** (referenced quote wins, else BC price list) to the **PO price**
+    (within `PRICE_TOL`): **our < PO** → process normally **and notify the customer** we billed our lower price
+    (a line is added to the acknowledgement email; `underPriced` → `acknowledge.js`); **our > PO** → the whole
+    document becomes a **Quote** (overrides stock — customer must accept the higher price; `priceForcesQuote`);
+    **our ≈ PO** → match; **PO priced but our price undeterminable** (item on no price list, no referenced quote)
+    → **review** (`priceUnknown`). Both prices stay **visible** on the card (per-line PO price + the our-price
+    note from Rules 6/8, plus a directional note). No manual price override — the direction decides.
   - **Order acknowledgement email** (`acknowledge.js`): on Approve→create the app composes a brief receipt and,
     when `ACK_SEND=1`, **sends it from `order@` via Graph `Mail.Send`**. Recipient = the PO's buyer email (NOT
     BC's scrubbed contact); `ACK_TEST_TO` redirects EVERY send to one address for testing (currently `navl@`).
@@ -105,7 +126,8 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     qty = extended, 5-decimal) and **PO total** shown on each card. **PDF links** open in the host's default
     viewer (`/api/open-pdf`, local-use).
   - Commands: `pipeline.js --run` (process new mail; also reconciles) · `--merge-preview` (show split-PO merges,
-    free) · `--reverify` (re-apply rules to cache, no Claude) · `--enrich` (dup-check + save PDFs) · `--reconcile`
+    free) · `--reverify` (re-apply rules to cache, no Claude) · `--enrich` (save source PDFs for EVERY card —
+    order/quote/review — so any card can link the PO; BC dup-check on order/quote) · `--reconcile`
     (BC-deleted back to queue + mailbox reconcile) · `--reconcile-mailbox` · `--rerender`. `server.js` serves the app.
 - **Step 6 (order creation):** write **proven** — `src/step6-order-creation/create.js`; `createDoc()` is the
   programmatic path the server calls. Dry-run default; guarded real write. **Dates:** sets **Requested Delivery
