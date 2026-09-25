@@ -30,7 +30,7 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createHash } from "node:crypto";
-import { collectThreads, fetchAttachmentBytes, fetchItemAttachmentFiles, fetchThreadByIds, messageInInbox, inboxContains } from "../ingestion/mailbox.js";
+import { collectThreads, fetchAttachmentBytes, fetchItemAttachmentFiles, fetchThreadByIds, inboxContains, inboxMessageIdSet } from "../ingestion/mailbox.js";
 import { makeClient, extractOne, countOne } from "../step2-extraction/extract.js";
 import { classifyOne } from "../step3-classification/classify.js";
 import { verifyOrder } from "../step4-bc-verification/verify.js";
@@ -381,20 +381,25 @@ async function cmdEnrich() {
 // (already out of the queue — and a future move-on-approve would move their mail itself).
 async function reconcileMailbox(store) {
   const targets = Object.entries(store.threads).filter(([, x]) => x.record && x.record.status !== "actioned");
+  if (!targets.length) return;
+  // ONE Inbox snapshot (paged id-only) instead of a Graph GET per cached message. If the
+  // snapshot is incomplete (a page errored), skip pruning entirely — never drop on a
+  // transient failure (same guarantee the per-id version had).
+  const snap = await inboxMessageIdSet();
+  if (!snap.ok) { console.log("  Mailbox reconcile: couldn't snapshot the Inbox — skipping (no cards dropped)."); return; }
+  const inbox = snap.ids;
   let removed = 0, checked = 0;
   for (const [cid, x] of targets) {
     const ids = x.message_ids || [];
     if (!ids.length) continue;
     checked++;
-    const states = [];
-    for (const id of ids) states.push(await messageInInbox(id));
-    if (states.some((s) => s === "in" || s === "unknown")) continue; // present or inconclusive -> keep
-    // All ids report gone — but default message ids can rotate, so CONFIRM via a content
-    // search (PO number, else a subject) that the email really isn't in the Inbox before
-    // dropping. Only a definitive "not found" removes; present/unknown keeps.
+    if (ids.some((id) => inbox.has(id))) continue; // at least one message still present -> keep
+    // None of this card's ids are in the snapshot — but default message ids can rotate, so
+    // CONFIRM via a content search (PO number, else subject) before dropping. Only a
+    // definitive "not found" removes; present (id rotated) or inconclusive keeps.
     const needle = x.record.po_number || x.record.conversation?.[0]?.subject;
     const present = await inboxContains(needle);
-    if (present !== false) continue; // true = still there (id rotated) ; null = couldn't confirm -> keep
+    if (present !== false) continue;
     console.log(`  ✂ removed PO ${x.record.po_number} (${x.record.customer?.name || ""}) — email no longer in Inbox`);
     delete store.threads[cid];
     removed++;

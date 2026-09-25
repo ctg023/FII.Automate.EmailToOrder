@@ -93,10 +93,14 @@ See [PROJECT-STATUS.md](PROJECT-STATUS.md) for the authoritative, detailed statu
     needing review. Created orders set the matched **ship-to address + contact** on the BC doc. Changing the
     customer (`/api/assign`) **re-scans Rules 4 & 5** and updates the Ship-To / Contact panels for the new customer.
   - **Mailbox reconcile** (read-only): drops cards whose **source email is no longer in the Inbox** (deleted or
-    moved out = a human handled it outside the app). Checks each cached message by id (`messageInInbox`), and —
-    because Graph **default message ids can rotate** — CONFIRMS an id-"gone" with a content `$search`
-    (`inboxContains`) before removing, so a rotated id never drops a present order. Runs inside `--run` and
-    `--reconcile`; standalone `--reconcile-mailbox`. (Still read-only — it prunes the local store, not the mailbox.)
+    moved out = a human handled it outside the app). Takes **ONE Inbox id snapshot** (`inboxMessageIdSet` —
+    paged, id-only) and checks each card's message ids against it locally (was a Graph GET **per** cached
+    message — the old slow path); a card is kept if any id is present. Because Graph **default message ids can
+    rotate**, an all-absent card is CONFIRMED with a content `$search` (`inboxContains`) before removing, so a
+    rotated id never drops a present order. If the snapshot is incomplete (a page errored) it prunes **nothing**
+    (never drops on a transient failure). Runs inside `--run` and `--reconcile`; standalone `--reconcile-mailbox`.
+    (Still read-only — it prunes the local store, not the mailbox.) The thread pull also fetches message bodies
+    **concurrently** (bounded, `mapLimit`) rather than one at a time.
   - **Ship-to picker:** a **change** link on the Ship-to row lists the customer's on-file `ShipTo` addresses
     (`listShipTos` → `/api/shiptos`); picking one (`/api/assign-shipto`, `forceShipTo`) clears the ship-to gate
     and is kept across re-verifies. On create, a **post-create classic-page PATCH** sets the established

@@ -54,6 +54,18 @@ async function gget(pathOrUrl, extraHeaders = {}) {
   return { ok: r.ok, status: r.status, json, text };
 }
 
+// Run an async fn over items with a bounded concurrency (default 8). Results keep input
+// order. Used to fan out per-message Graph GETs instead of awaiting them one at a time.
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length || 1) }, async () => {
+    while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 function loadState() {
   try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch { return { processed: {} }; }
 }
@@ -131,6 +143,24 @@ export async function inboxContains(query) {
   return (r.json?.value || []).length > 0;
 }
 
+// Read-only: a SNAPSHOT of every message id currently in the Inbox (paged, id-only) —
+// one bounded scan instead of a GET per cached message. Returns { ok, ids:Set, capped }.
+// ok:false (a page errored) means the snapshot is incomplete, so callers must NOT drop
+// anything from it (the reconcile skips pruning in that case). `capped` = the Inbox has
+// more than maxPages*pageSize messages; still correct (a beyond-cap id just becomes a
+// "suspect" that the $search confirms), only slightly more searches.
+export async function inboxMessageIdSet({ pageSize = 999, maxPages = 50 } = {}) {
+  const ids = new Set();
+  let url = `${mbPath()}/mailFolders/Inbox/messages?$select=id&$top=${pageSize}`;
+  for (let i = 0; i < maxPages && url; i++) {
+    const r = await gget(url);
+    if (!r.ok) return { ok: false, ids, capped: false };
+    for (const m of r.json?.value || []) if (m.id) ids.add(m.id);
+    url = r.json?.["@odata.nextLink"] || null;
+  }
+  return { ok: true, ids, capped: !!url };
+}
+
 // Read-only: is a message still in the Inbox? Returns "in" | "gone" | "unknown".
 // NOTE: a folder-scoped GET (/mailFolders/Inbox/messages/{id}) does NOT enforce the
 // folder — Graph resolves by id regardless — so we must compare parentFolderId. A
@@ -158,8 +188,9 @@ export async function collectThreads({ limit = 50, folders = ["Inbox", "SentItem
     let heads = [];
     try { heads = await listMessages(limit, folder); }
     catch (e) { if (direction === "outbound") continue; throw e; } // Sent optional; skip if absent
-    for (const h of heads) {
-      const { msg, atts } = await fetchMessage(h.id);
+    // Fetch the full bodies + attachments concurrently (bounded) rather than one-at-a-time.
+    const fetched = await mapLimit(heads, 8, (h) => fetchMessage(h.id));
+    for (const { msg, atts } of fetched) {
       if (!msg) continue;
       const rec = msgRecord(msg, atts, direction);
       if (!byConv.has(rec.conversationId)) byConv.set(rec.conversationId, []);
